@@ -28,7 +28,7 @@ Before setting up OceanEvoMap, ensure the following are installed:
 3. **Git**: Ensure Git is installed to clone the repository:
   ```bash
   sudo apt-get install -y git
-
+  ```
 4. **NCBI Entrez**: Update Entrez.email in app.py with a valid email for API access.
 
 ## Setup Instructions
