@@ -306,48 +306,114 @@ def circle_to_polygon(lon, lat, radius_km=100, num_points=32):
     wkt = "POLYGON((" + ", ".join(f"{x:.6f} {y:.6f}" for x, y in points) + "))"
     return wkt
 
-@lru_cache(maxsize=1000)  # Cache up to 1000 taxon lookups
+
+@lru_cache(maxsize=1000)
 def fetch_colloquial_name(taxon):
     """
-    Fetch colloquial name for a given taxon from WoRMS, with fallback for common species.
-    Skips non-species taxa to avoid pointless API calls.
-    
-    Args:
-        taxon (str): Scientific name of the species or higher taxon.
-    
-    Returns:
-        str: Colloquial name, taxon name with rank indicator, or 'Unknown'.
+    Fetch colloquial name with multi-source fallback. Prioritizes English/marine-relevant names.
+    Returns 'Unknown' if nothing found; italicizes if from a related/fallback source.
     """
     if not taxon or taxon.lower() == 'unknown':
-        logger.debug(f"Invalid taxon input: {taxon}")
         return 'Unknown'
     
-    # Skip non-species taxa (rough check: species names usually have a space)
-    if len(taxon.split()) < 2:
-        logger.debug(f"Skipping colloquial lookup for non-species taxon: {taxon}")
+    if len(taxon.split()) < 2:  # Skip non-species, but try phylum-level
         return f"{taxon} (genus or higher)"
     
-    # Try WoRMS API
+    # 1. WoRMS (existing)
     try:
-        logger.debug(f"Querying WoRMS for taxon: {taxon}")
-        resp = pyworms.aphiaRecordsByName(taxon, marine_only=False)  # Allow non-marine for broader matches
+        resp = pyworms.aphiaRecordsByName(taxon, marine_only=False)
         if resp and isinstance(resp, list) and len(resp) > 0:
             vernacular = resp[0].get('vernacularname', '')
             if vernacular:
-                logger.debug(f"WoRMS found vernacular: {vernacular} for {taxon}")
                 return vernacular.split(',')[0].strip()
-            else:
-                logger.debug(f"No vernacular name in WoRMS for {taxon}")
-        else:
-            logger.debug(f"No WoRMS records for {taxon}")
-    except requests.exceptions.HTTPError as e:
-        logger.warning(f"WoRMS HTTP error for {taxon}: {e}")
-    except requests.exceptions.ConnectionError as e:
-        logger.warning(f"WoRMS connection error for {taxon}: {e}")
-    except Exception as e:
-        logger.warning(f"WoRMS unexpected error for {taxon}: {e}")
+    except Exception:
+        pass
     
-    logger.info(f"No colloquial name found for {taxon}")
+    # 2. GBIF API: Query vernacularNames endpoint
+    try:
+        gbif_url = f"https://api.gbif.org/v1/species/match?name={taxon}"
+        gbif_resp = requests.get(gbif_url, timeout=5).json()
+        if gbif_resp.get('usageKey'):
+            key = gbif_resp['usageKey']
+            vern_url = f"https://api.gbif.org/v1/species/{key}/vernacularNames?language=eng"
+            vern_resp = requests.get(vern_url, timeout=5).json()
+            results = vern_resp.get('results', [])
+            if results:
+                # Prefer preferred or first English
+                for v in results:
+                    if v.get('language') == 'eng' and v.get('vernacularName'):
+                        return v['vernacularName'].split(',')[0].strip()
+                return results[0].get('vernacularName', 'Unknown')  # Fallback any
+        # If no species match, try parent (for phylum-level like arrow worm)
+        if gbif_resp.get('kingdomKey') or gbif_resp.get('phylumKey'):
+            parent_key = gbif_resp.get('phylumKey') or gbif_resp.get('kingdomKey')
+            if parent_key:
+                vern_url = f"https://api.gbif.org/v1/species/{parent_key}/vernacularNames?language=eng"
+                vern_resp = requests.get(vern_url, timeout=5).json()
+                results = vern_resp.get('results', [])
+                if results:
+                    for v in results:
+                        if v.get('language') == 'eng' and v.get('vernacularName'):
+                            return v['vernacularName'].split(',')[0].strip() + ' (phylum-level)'
+    except Exception as e:
+        logger.warning(f"GBIF error for {taxon}: {e}")
+    
+    # 3. ITIS API: Fixed endpoints and parsing
+    try:
+        search_url = f"https://www.itis.gov/ITISWebService/jsonservice/searchByScientificName?srchKey={taxon.replace(' ', '%20')}"
+        search_resp = requests.get(search_url, timeout=5).json()
+        scientific_names = search_resp.get('scientificNames', [])
+        if scientific_names:
+            tsn = scientific_names[0].get('tsn', '')
+            if tsn:
+                common_url = f"https://www.itis.gov/ITISWebService/jsonservice/getCommonNamesFromTSN?tsn={tsn}"
+                common_resp = requests.get(common_url, timeout=5).json()
+                common_names = common_resp.get('commonNames', [])
+                if common_names:
+                    for cn in common_names:
+                        if cn.get('language') == 'English' and cn.get('commonName'):
+                            return cn['commonName'].strip()
+                    return common_names[0].get('commonName', 'Unknown')  # Fallback
+    except Exception as e:
+        logger.warning(f"ITIS error for {taxon}: {e}")
+    
+    # 4. NCBI fallback: Quick lit search for common name in abstracts
+    try:
+        term = f"{taxon}[organism] AND (common name OR english name OR vernacular)"
+        search_handle = Entrez.esearch(db="pubmed", term=term, retmax=1)
+        search_results = Entrez.read(search_handle)
+        search_handle.close()
+        if search_results["IdList"]:
+            fetch_handle = Entrez.efetch(db="pubmed", id=search_results["IdList"][0], rettype="abstract", retmode="text")
+            abstract = fetch_handle.read()
+            fetch_handle.close()
+            # Simple regex for common name (e.g., "known as arrow worm")
+            import re
+            match = re.search(r'(?:known as|called|common name[:\s]+)(\w+\s+\w+)', abstract, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+    except Exception as e:
+        logger.warning(f"NCBI error for {taxon}: {e}")
+    
+    # 5. DuckDuckGo fallback: Instant answer API for quick web search
+    try:
+        ddg_url = f"https://api.duckduckgo.com/?q=common+name+of+{taxon.replace(' ', '+')}&format=json&pretty=1"
+        ddg_resp = requests.get(ddg_url, timeout=5).json()
+        abstract = ddg_resp.get('Abstract', '')
+        if abstract:
+            match = re.search(r'(?:known as|called|common name is|also known as)\s*(?:the\s*)?([\w\s]+?)(?:,|\.|$)', abstract, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        related = ddg_resp.get('RelatedTopics', [])
+        if related:
+            for rel in related:
+                text = rel.get('Text', '')
+                match = re.search(r'(?:common name|vernacular)\s*:\s*([\w\s]+)', text, re.IGNORECASE)
+                if match:
+                    return match.group(1).strip()
+    except Exception as e:
+        logger.warning(f"DuckDuckGo error for {taxon}: {e}")
+    
     return 'Unknown'
         
 
