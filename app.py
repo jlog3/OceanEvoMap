@@ -5,6 +5,7 @@ import pandas as pd
 import requests
 from streamlit_folium import st_folium
 import matplotlib.pyplot as plt
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 import io
 from PIL import Image
 import base64
@@ -19,43 +20,35 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 import numpy as np
 import math
 from shapely.wkt import loads
-from folium.plugins import MarkerCluster, HeatMap
+from folium.plugins import MarkerCluster, HeatMap, MeasureControl
 import pyworms
 from functools import lru_cache
 import re
-import logging  # Add this if not present
-from Bio.Align import PairwiseAligner  # Ensure imported for fallback
+import logging # Add this if not present
+from Bio.Align import PairwiseAligner # Ensure imported for fallback
 import urllib3; urllib3.disable_warnings()
-
-
-
 # Temporary patch for pyobis logging bug: Redirect tqdm output to avoid invalid kwargs
 class TqdmLoggingHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            from tqdm import tqdm  # Import here to avoid global
+            from tqdm import tqdm # Import here to avoid global
             tqdm.write(msg)
             self.flush()
         except Exception:
             self.handleError(record)
-
 # In your app setup, after imports:
 logger = logging.getLogger('pyobis')
 logger.addHandler(TqdmLoggingHandler())
-logger.propagate = False  # Prevent double-logging
-
-
+logger.propagate = False # Prevent double-logging
 Entrez.email = os.getenv("ENTREZ_EMAIL", st.text_input("Enter your email for NCBI Entrez"))
 Entrez.api_key = os.getenv("ENTREZ_API_KEY")
-
 # Streamlit UI setup
 st.title("Ocean Layers: Seafloor & Evolution Explorer")
 st.markdown("Explore seafloor bathymetry, coral reefs, and evolutionary patterns of marine life. Click near blue occurrence points or search for real phylogenetic trees!")
 st.subheader("Customize Layers")
 show_reefs = st.checkbox("Show Coral Reefs (Optional)", value=False)
 show_stats = st.checkbox("Show Global Ocean Stats (Optional)", value=False)
-
 if st.button("Reset Map and Search"):
     st.session_state.clear()
 # Initialize session state
@@ -65,7 +58,6 @@ if 'biodiversity_data' not in st.session_state:
     st.session_state.biodiversity_data = {}
 if 'click_counter' not in st.session_state:
     st.session_state.click_counter = 0
-
 # Sidebar for clicked points summary
 st.sidebar.subheader("Clicked Points Summary")
 if st.session_state.clicked_points:
@@ -75,7 +67,6 @@ if st.session_state.clicked_points:
     st.sidebar.download_button("Download Summary CSV", csv, "clicked_points.csv", "text/csv")
 else:
     st.sidebar.write("No points clicked yet.")
-
 # Initialize map
 with st.spinner("Initializing map..."):
     m = folium.Map(location=[0, 0], zoom_start=2, tiles=None)
@@ -88,6 +79,8 @@ with st.spinner("Initializing map..."):
         transparent=True,
         name="Seafloor Bathymetry (GEBCO)",
     ).add_to(m)
+    # Add scale (measure control)
+    MeasureControl(position='bottomleft', primary_length_unit='kilometers', secondary_length_unit=None, primary_area_unit=None, secondary_area_unit=None).add_to(m)
 
 @st.cache_data
 def load_shapefile(reef_path):
@@ -96,7 +89,6 @@ def load_shapefile(reef_path):
         reefs = reefs.to_crs("EPSG:4326")
     reefs['geometry'] = reefs['geometry'].simplify(tolerance=0.01, preserve_topology=True)
     return reefs
-
 # Coral reefs layer
 if show_reefs:
     reef_dir = "data/14_001_WCMC008_CoralReefs2018_v4_1/01_Data"
@@ -143,7 +135,6 @@ if show_reefs:
             st.warning(f"Error loading {selected_shp}: {e}.")
     else:
         st.warning("No shapefiles found in 'data/14_001_WCMC008_CoralReefs2018_v4_1/01_Data'.")
-
 @st.cache_data
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def fetch_obis_data(geom, size=100):
@@ -158,14 +149,14 @@ def fetch_obis_data(geom, size=100):
         else:
             results = occ_data.get('results', [])
         print(f"INFO: Raw OBIS results: {results[:2]}") # Debug: Log first records
-      
+   
         # Extract all scientific names
         for rec in results:
             if rec: # Skip empty
                 sci_name = rec.get('scientificName', 'Unknown')
                 if sci_name and sci_name != 'Unknown' and isinstance(sci_name, str):
                     taxa.append(sci_name.strip())
-              
+           
                 # For occurrences, use lat/lon and the resolved name
                 lat = rec.get('decimalLatitude')
                 lon = rec.get('decimalLongitude')
@@ -180,7 +171,7 @@ def fetch_obis_data(geom, size=100):
     except Exception as e:
         print(f"ERROR: OBIS API error: {e}")
         return {'species': [], 'occurrences': []}
-      
+   
 def geocode(location):
     url = f"https://nominatim.openstreetmap.org/search?q={location}&format=json"
     headers = {'User-Agent': 'StreamlitOceanExplorer/1.0'}
@@ -190,7 +181,6 @@ def geocode(location):
         if data:
             return float(data[0]['lat']), float(data[0]['lon'])
     return None
-
 @lru_cache(maxsize=1000)
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def fetch_sequence(taxon):
@@ -211,7 +201,6 @@ def fetch_sequence(taxon):
     except Exception as e:
         print(f"WARNING: Failed to fetch sequence for {taxon}: {e}")
         return None
-
 def is_species_level(taxon):
     """Check if taxon is at species level."""
     try:
@@ -224,7 +213,6 @@ def is_species_level(taxon):
         return False
     except:
         return len(taxon.split()) > 1
-
 # Updated align_sequences function
 def align_sequences(sequences):
     """Align sequences using MAFFT, with fallback to pairwise alignment or unaligned sequences."""
@@ -232,41 +220,41 @@ def align_sequences(sequences):
         result = subprocess.run(["mafft", "--version"], capture_output=True, text=True, check=False)
         if result.returncode != 0:
             raise FileNotFoundError("MAFFT is not installed or not found in PATH.")
-        
+     
         temp_fasta = "temp.fasta"
         aligned_fasta = "aligned.fasta"
-        
+     
         # Temporarily shorten IDs to avoid MAFFT truncation issues (>250 chars)
-        original_ids = [rec.id for rec in sequences]  # Save originals
+        original_ids = [rec.id for rec in sequences] # Save originals
         for i, rec in enumerate(sequences):
             short_id = f"seq_{i:04d}"
             rec.id = short_id
             rec.name = short_id
             rec.description = short_id
-        
+     
         with open(temp_fasta, "w") as f:
             SeqIO.write(sequences, f, "fasta")
-        
+     
         subprocess.run(["mafft", "--auto", "--quiet", temp_fasta], stdout=open(aligned_fasta, "w"), check=True, text=True)
-        
+     
         if not os.path.exists(aligned_fasta) or os.path.getsize(aligned_fasta) == 0:
             raise RuntimeError("MAFFT produced no output or an empty file.")
-        
+     
         aligned = list(SeqIO.parse(aligned_fasta, "fasta"))
-        
+     
         # Remap original IDs (order preserved)
         for i, rec in enumerate(aligned):
             rec.id = original_ids[i]
             rec.name = original_ids[i]
             rec.description = original_ids[i]
-        
+     
         for file in [temp_fasta, aligned_fasta]:
             if os.path.exists(file):
                 os.remove(file)
-        
+     
         if not aligned:
             raise ValueError("No sequences found in MAFFT output.")
-        
+     
         return aligned
     except FileNotFoundError:
         st.warning("MAFFT is not installed. Falling back to progressive pairwise alignment.")
@@ -276,16 +264,16 @@ def align_sequences(sequences):
             if len(sequences) < 2:
                 st.error("Insufficient sequences for alignment.")
                 return sequences
-            
+         
             # Progressive pairwise for >2 sequences (simple chain)
             aligned_seqs = [sequences[0]]
             for seq in sequences[1:]:
                 alignments = aligner.align(aligned_seqs[-1].seq, seq.seq)
                 # Take first alignment, update last with gaps if needed (basic)
-                aligned_seqs[-1].seq = alignments[0][0]  # Update previous
-                seq.seq = alignments[0][1]  # Update current
+                aligned_seqs[-1].seq = alignments[0][0] # Update previous
+                seq.seq = alignments[0][1] # Update current
                 aligned_seqs.append(seq)
-            
+         
             return aligned_seqs
         except Exception as e:
             st.error(f"Pairwise alignment failed: {e}. Returning unaligned sequences.")
@@ -297,13 +285,13 @@ def align_sequences(sequences):
             if os.path.exists(file):
                 os.remove(file)
         return sequences
-
 def render_tree(newick, title):
     """Render a phylogenetic tree from a Newick string."""
     try:
         tree_io = io.StringIO(newick)
         tree = Phylo.read(tree_io, "newick")
-        fig, ax = plt.subplots(figsize=(6, 6))
+        num_leaves = len(tree.get_terminals())
+        fig, ax = plt.subplots(figsize=(8, max(6, num_leaves * 0.5)))
         Phylo.draw(tree, axes=ax, do_show=False)
         ax.set_title(title)
         img_buffer = io.BytesIO()
@@ -314,6 +302,46 @@ def render_tree(newick, title):
     except Exception as e:
         st.warning(f"Tree rendering failed: {e}")
         return None
+def render_tree_with_images(newick, title, sci_to_label):
+    tree_io = io.StringIO(newick)
+    tree = Phylo.read(tree_io, "newick")
+    num_leaves = len(tree.get_terminals())
+    fig = plt.figure(figsize=(12, max(6, num_leaves * 0.5)))
+    ax_tree = fig.add_axes([0.05, 0.05, 0.65, 0.9])
+    Phylo.draw(tree, axes=ax_tree, do_show=False)
+    ax_tree.set_title(title)
+    # Extract leaf y positions from text labels
+    leaf_y = {}
+    for text in ax_tree.texts:
+        name = text.get_text()
+        leaf_y[name] = text.get_position()[1]
+    # Create inverse map for taxon lookup
+    label_to_sci = {v: k for k, v in sci_to_label.items()}
+    # Add image axes
+    ax_images = fig.add_axes([0.75, 0.05, 0.2, 0.9], frameon=False)
+    ax_images.set_xlim(-0.1, 1)
+    ax_images.set_ylim(ax_tree.get_ylim())
+    ax_images.set_xticks([])
+    ax_images.set_yticks([])
+    # Place images next to leaves
+    for label, y in leaf_y.items():
+        taxon = label_to_sci.get(label)
+        if taxon:
+            img_url = get_species_image(taxon)
+            if img_url:
+                try:
+                    response = requests.get(img_url, timeout=5)
+                    img = Image.open(io.BytesIO(response.content))
+                    imagebox = OffsetImage(img, zoom=0.05)  # Adjust zoom for size
+                    ab = AnnotationBbox(imagebox, (0, y), xycoords='data', boxcoords="data", pad=0, frameon=False, box_alignment=(0, 0.5))
+                    ax_images.add_artist(ab)
+                except Exception as e:
+                    print(f"Failed to add image for {taxon}: {e}")
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format="png", dpi=300)
+    img_buffer.seek(0)
+    plt.close(fig)
+    return Image.open(img_buffer)
 
 def circle_to_polygon(lon, lat, radius_km=100, num_points=32):
     points = []
@@ -326,7 +354,6 @@ def circle_to_polygon(lon, lat, radius_km=100, num_points=32):
     points.append(points[0])
     wkt = "POLYGON((" + ", ".join(f"{x:.6f} {y:.6f}" for x, y in points) + "))"
     return wkt
-
 @lru_cache(maxsize=1000)
 def fetch_colloquial_name(taxon):
     """
@@ -335,10 +362,8 @@ def fetch_colloquial_name(taxon):
     """
     if not taxon or taxon.lower() == 'unknown':
         return 'Unknown', 'N/A'
-  
     if len(taxon.split()) < 2: # Skip non-species, but try phylum-level
         return f"{taxon} (genus or higher)", 'Taxonomy'
-  
     # 1. WoRMS (existing)
     try:
         resp = pyworms.aphiaRecordsByName(taxon, marine_only=False)
@@ -348,8 +373,7 @@ def fetch_colloquial_name(taxon):
                 return vernacular.split(',')[0].strip(), 'WoRMS'
     except Exception:
         pass
-  
-    # 2. GBIF API: Query vernacularNames endpoint
+   # 2. GBIF API: Query vernacularNames endpoint
     try:
         gbif_url = f"https://api.gbif.org/v1/species/match?name={taxon}"
         gbif_resp = requests.get(gbif_url, timeout=5).json()
@@ -377,7 +401,6 @@ def fetch_colloquial_name(taxon):
                             return v['vernacularName'].split(',')[0].strip() + ' (phylum-level)', 'GBIF'
     except Exception as e:
         print(f"WARNING: GBIF error for {taxon}: {e}")
-  
     # 3. ITIS API: Fixed endpoints and parsing
     try:
         search_url = f"https://www.itis.gov/ITISWebService/jsonservice/searchByScientificName?srchKey={taxon.replace(' ', '%20')}"
@@ -396,7 +419,6 @@ def fetch_colloquial_name(taxon):
                     return common_names[0].get('commonName', 'Unknown'), 'ITIS' # Fallback
     except Exception as e:
         print(f"WARNING: ITIS error for {taxon}: {e}")
-  
     # 4. NCBI fallback: Quick lit search for common name in abstracts
     try:
         term = f"{taxon}[organism] AND (common name OR english name OR vernacular)"
@@ -413,7 +435,6 @@ def fetch_colloquial_name(taxon):
                 return match.group(1).strip(), 'NCBI Literature'
     except Exception as e:
         print(f"WARNING: NCBI error for {taxon}: {e}")
-  
     # 5. DuckDuckGo fallback: Instant answer API for quick web search
     try:
         ddg_url = f"https://api.duckduckgo.com/?q=common+name+of+{taxon.replace(' ', '+')}&format=json&pretty=1"
@@ -432,20 +453,17 @@ def fetch_colloquial_name(taxon):
                     return match.group(1).strip(), 'DuckDuckGo'
     except Exception as e:
         print(f"WARNING: DuckDuckGo error for {taxon}: {e}")
-  
     return 'Unknown', 'N/A'
-      
+   
 @lru_cache(maxsize=100) # Cache to avoid redundant OBIS calls
 def resolve_to_species(taxon_list, center_lat, center_lon, max_per_taxon=1):
     """
     Resolve higher-rank taxa to species-level names, preferring those near (center_lat, center_lon).
-  
     Args:
         taxon_list (list): List of taxa (species or higher ranks).
         center_lat (float): Latitude of the clicked point.
         center_lon (float): Longitude of the clicked point.
         max_per_taxon (int): Max species to pick per higher taxon.
-  
     Returns:
         list: List of species-level names.
     """
@@ -457,7 +475,7 @@ def resolve_to_species(taxon_list, center_lat, center_lon, max_per_taxon=1):
         if len(taxon.split()) >= 2 and is_species_level(taxon):
             resolved.append(taxon)
             continue
-      
+   
         try:
             # Get AphiaID
             cl_data = checklist.list(scientificname=taxon).execute()
@@ -465,22 +483,29 @@ def resolve_to_species(taxon_list, center_lat, center_lon, max_per_taxon=1):
             if not results or not isinstance(results, list):
                 print(f"WARNING: No valid results for {taxon} in checklist")
                 continue
+            if not results[0]:
+                print(f"WARNING: results[0] is None or falsy for {taxon}")
+                continue
             aphiaid = results[0].get('aphiaID')
             if not aphiaid:
                 print(f"WARNING: No AphiaID for {taxon}")
                 continue
-          
+       
             # Get child species via OBIS API
             child_url = f"https://api.obis.org/v3/taxon/{aphiaid}/children?rank=Species"
             response = requests.get(child_url)
             response.raise_for_status()
             child_data = response.json()
-            child_species = [rec['scientificName'] for rec in child_data.get('results', []) if rec.get('taxonRank') == 'Species']
-          
+            child_results = child_data.get('results', [])
+            if not child_results or not isinstance(child_results, list):
+                print(f"WARNING: No valid child results for {taxon}")
+                continue
+            child_species = [rec['scientificName'] for rec in child_results if rec.get('taxonRank') == 'Species']
+       
             if not child_species:
                 print(f"WARNING: No child species for {taxon}")
                 continue
-          
+       
             # Filter by proximity (bounding box: ±5° around center)
             bbox = f"POLYGON(({center_lon-5} {center_lat-5},{center_lon-5} {center_lat+5},{center_lon+5} {center_lat+5},{center_lon+5} {center_lat-5},{center_lon-5} {center_lat-5}))"
             geo_filtered = []
@@ -490,25 +515,22 @@ def resolve_to_species(taxon_list, center_lat, center_lon, max_per_taxon=1):
                     geo_filtered.append(sp)
                     if len(geo_filtered) >= max_per_taxon:
                         break
-          
+       
             # If no geo-match, pick first species as fallback
             to_add = geo_filtered if geo_filtered else child_species[:max_per_taxon]
             resolved.extend(to_add)
             print(f"INFO: Resolved {taxon} to: {to_add}")
         except Exception as e:
             print(f"WARNING: Resolution failed for {taxon}: {e}")
-  
     resolved = list(set(resolved)) # Dedupe final list
     if not resolved:
         print("INFO: No species resolved; returning original list")
         return [t for t in taxon_list if isinstance(t, str) and len(t.split()) >= 2] # Keep only species-like
     return resolved
-
 def get_species_image(taxon):
     """Fetch a thumbnail image URL for the species from WoRMS or Wikimedia Commons."""
     colloquial, _ = fetch_colloquial_name(taxon)
     search_term = colloquial if colloquial != 'Unknown' else taxon
-
     # Prioritize WoRMS
     try:
         resp = pyworms.aphiaRecordsByName(taxon, marine_only=False)
@@ -528,7 +550,6 @@ def get_species_image(taxon):
                         return img_src
     except Exception as e:
         print(f"WARNING: Failed to fetch WoRMS image for {taxon}: {e}")
-
     # Fallback to Wikimedia Commons search
     try:
         search_url = f"https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(search_term)}&srnamespace=6&format=json&srlimit=1"
@@ -544,28 +565,22 @@ def get_species_image(taxon):
                     return page['imageinfo'][0]['thumburl']
     except Exception as e:
         print(f"WARNING: Failed to fetch Wikimedia Commons image for {search_term}: {e}")
-   
     return None
-  
-def build_phylogenetic_tree(species_list, num_sequences, region, center_lat=None, center_lon=None, label_type="Scientific Name"):
+def build_phylogenetic_tree(species_list, num_sequences, region, center_lat=None, center_lon=None):
     """
-    Build a phylogenetic tree from COI sequences for given species.
-  
+    Build a phylogenetic tree from COI sequences for given species. Always uses scientific names for labels during construction.
     Args:
         species_list (list): List of taxa from OBIS.
         num_sequences (int): Number of sequences to fetch.
         region (str): Region name for display.
         center_lat (float): Latitude of clicked point (optional).
         center_lon (float): Longitude of clicked point (optional).
-        label_type (str): Type of label for tree nodes: 'Scientific Name', 'Common Name', 'NCBI Accession'.
-  
     Returns:
-        tuple: (newick string, phylogenetic diversity score, insight message, used_taxa)
+        tuple: (newick string with scientific labels, phylogenetic diversity score, insight message with scientific names, used_taxa)
     """
     if not species_list or all(s == 'Unknown' for s in species_list):
         st.warning(f"No valid species found for {region}. Cannot build phylogenetic tree.")
         return None, 0.0, "No valid species data available.", []
-
     # Resolve higher ranks to species, using geographic context if provided
     if center_lat is not None and center_lon is not None:
         with st.spinner("Resolving higher-rank taxa to species..."):
@@ -593,12 +608,7 @@ def build_phylogenetic_tree(species_list, num_sequences, region, center_lat=None
             if record:
                 colloquial, source = fetch_colloquial_name(taxon)
                 ncbi_id = record.id
-                if label_type == "Scientific Name":
-                    label = taxon
-                elif label_type == "NCBI Accession":
-                    label = ncbi_id
-                else: # Common Name
-                    label = f"{colloquial} ({taxon})" if colloquial != 'Unknown' else taxon
+                label = taxon # Always use scientific name for building
                 record.id = label
                 record.name = label
                 sequences.append(record)
@@ -617,23 +627,22 @@ def build_phylogenetic_tree(species_list, num_sequences, region, center_lat=None
             f"Could not fetch sequences for {len(failed_taxa)} taxa (e.g., {', '.join(failed_taxa[:3])}). "
             f"Only {len(sequences)} sequences retrieved."
         )
-
     if len(sequences) < 2:
         st.warning(f"Insufficient sequences ({len(sequences)}) to build a tree for {region}.")
         return None, 0.0, f"Only {len(sequences)} sequences retrieved; minimum 2 required.", []
-    
+ 
     try:
         with st.spinner("Aligning sequences and building tree..."):
             aligned_sequences = align_sequences(sequences)
             aln = MultipleSeqAlignment(aligned_sequences)
-            
+         
             # Debug: Check for duplicates before distance calc
             names = [s.id for s in aln]
             unique_names = set(names)
             if len(names) != len(unique_names):
                 st.error(f"Duplicates detected after alignment for {region}: {[n for n in unique_names if names.count(n) > 1]}")
                 raise ValueError("Duplicate names found after alignment")
-            
+         
             calculator = DistanceCalculator('identity')
             dm = calculator.get_distance(aln)
             constructor = DistanceTreeConstructor()
@@ -643,19 +652,23 @@ def build_phylogenetic_tree(species_list, num_sequences, region, center_lat=None
             newick = output.getvalue().strip()
             dtree = dendropy.Tree.get(data=newick, schema='newick')
             pd_score = sum(e.length for e in dtree.edges() if e.length is not None)
-            pd_score = 0.0 if math.isnan(pd_score) or pd_score is None else pd_score  # Handle NaN
+            pd_score = 0.0 if math.isnan(pd_score) or pd_score is None else pd_score # Handle NaN
             divergence_insight = f"Tree built from COI sequences of {', '.join([s.name for s in sequences])}"
             return newick, pd_score, divergence_insight, used_taxa
     except Exception as e:
         st.warning(f"Tree construction failed for {region}: {e}.")
         return None, 0.0, f"Tree construction failed: {str(e)}", []
-
-
 # Biodiversity points and heatmap
 biodiversity_points = [
-    {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
-    {"lat": 20.0, "lon": -40.0, "region": "Mid-Atlantic Ridge"},
-    {"lat": -30.0, "lon": 50.0, "region": "Indian Ocean Seamount"}
+    # {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"}, # Resolved to 61 species-level taxa
+    # {"lat": 20.0, "lon": -40.0, "region": "Mid-Atlantic Ridge"}, # 2 species, 1 seq only
+    # {"lat": -30.0, "lon": 50.0, "region": "Indian Ocean Seamount"}, # Resolved to 15 species-level taxa Could not fetch sequences for 6 taxa (e.g., Candidatus Pelagibacter, Amphiophiura sculptilis, Cystisoma fabricii). Only 9 sequences retrieved.
+    # {"lat": -2.0, "lon": 130.0, "region": "Coral Triangle"}, # Resolved to 59 species-level taxa
+    # {"lat": -0.5, "lon": -90.5, "region": "Galápagos Islands"}, # Resolved to 59 species-level taxa
+    # {"lat": 30.0, "lon": -60.0, "region": "Sargasso Sea"}, # Resolved to 8 species-level taxa Could not fetch sequences for 1 taxa (e.g., Eustomias obscurus). Only 7 sequences retrieved.
+    {"lat": -55.0, "lon": -60.0, "region": "Antarctic Peninsula"}, # Resolved to 35 species-level taxa
+    # {"lat": 36.8, "lon": -122.0, "region": "Monterey Bay Kelp Forests"}, # Resolved to 44 species-level taxa
+    # {"lat": 12.0, "lon": 93.0, "region": "Andaman Sea"} # Resolved to 47 species-level taxa
 ]
 heatmap_data = []
 occurrence_layer = folium.FeatureGroup(name="OBIS Occurrence Points").add_to(m)
@@ -673,9 +686,8 @@ for point in biodiversity_points:
         occ_list = obis_data['occurrences']
         species_count = len(species_list)
         num_sequences = min(10, len(species_list))
-        label_type = "Scientific Name" # Default for predefined points
         newick, pd_score, divergence_insight, used_taxa = build_phylogenetic_tree(
-            species_list, num_sequences, point['region'], point['lat'], point['lon'], label_type
+            species_list, num_sequences, point['region'], point['lat'], point['lon']
         )
         if not species_list:
             species_count = 0
@@ -726,33 +738,13 @@ for point in biodiversity_points:
         print(f"ERROR: Error for {point['region']}: {e}")
         pd_score = 0.0
         heatmap_data.append([point["lat"], point["lon"], pd_score])
-
 max_pd = max([d[2] for d in heatmap_data] or [0])
 # In heatmap_data_normalized: Handle 0 max_pd gracefully (your existing code is fine, but add)
 if max_pd == 0:
     heatmap_data_normalized = [[d[0], d[1], 0] for d in heatmap_data]
 else:
     heatmap_data_normalized = [[d[0], d[1], np.log1p(d[2]) / np.log1p(max_pd) if not math.isnan(d[2]) else 0] for d in heatmap_data]
-
 HeatMap(heatmap_data_normalized, name="Phylogenetic Diversity Heatmap", gradient={0.2: "blue", 0.6: "yellow", 1.0: "red"}).add_to(m)
-
-# Legend
-legend_html = '''
-     <div style="position: fixed;
-     bottom: 50px; left: 50px; width: 150px; height: 120px;
-     border:2px solid grey; z-index:9999; font-size:14px;
-     background-color:white;
-     ">
-     &nbsp; Heatmap Legend <br>
-     &nbsp; Low &nbsp; <i style="background:blue;width:20px;height:20px;display:inline-block;"></i> <br>
-     &nbsp; Medium &nbsp; <i style="background:yellow;width:20px;height:20px;display:inline-block;"></i> <br>
-     &nbsp; High &nbsp; <i style="background:red;width:20px;height:20px;display:inline-block;"></i> <br>
-     &nbsp; Blue Markers: OBIS Data Points
-     </div>
-     '''
-
-m.get_root().html.add_child(folium.Element(legend_html))
-
 # Global marine habitat stats
 if show_stats:
     st.subheader("Global Marine Habitat Coverage")
@@ -810,13 +802,11 @@ if show_stats:
             st.warning(f"Error loading global-stats.xlsx: {e}. Download from https://habitats.oceanplus.org/")
     else:
         st.warning("Global stats file not found. Download from https://habitats.oceanplus.org/")
-
 folium.LayerControl().add_to(m)
 # Interactive map
 st.subheader("Interactive Map (Click near blue markers to fetch data)")
 radius_km = st.slider("Search Radius (km)", min_value=50, max_value=500, value=100, step=50)
 map_output = st_folium(m, width=700, height=500, returned_objects=["last_clicked"], key=f"main_map_{st.session_state.click_counter}")
-
 # Handle map clicks
 if map_output and map_output.get("last_clicked"):
     st.session_state.click_counter += 1
@@ -838,6 +828,9 @@ if map_output and map_output.get("last_clicked"):
         style_function=lambda x: {"color": "red", "weight": 2, "fillOpacity": 0.2},
         tooltip=f"Search Area (~{radius_km}km radius)"
     ).add_to(click_layer)
+    # Zoom to the clicked area
+    bounds = poly_gdf.total_bounds
+    m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
     with st.spinner("Fetching OBIS data..."):
         obis_data = fetch_obis_data(geom, size=100)
         species_list = obis_data['species']
@@ -865,26 +858,54 @@ if map_output and map_output.get("last_clicked"):
             )
             if num_sequences > 20:
                 st.warning(f"Fetching {num_sequences} sequences may take several minutes. Please be patient.")
-            newick, pd_score, divergence_insight, used_taxa = build_phylogenetic_tree(
-                species_list, num_sequences, "Clicked Location", clicked_lat, clicked_lon, label_type
-            )
-            if newick:
-                tree_img = render_tree(newick, "Phylogenetic Tree at Clicked Location")
-                if tree_img:
-                    st.image(tree_img)
+            tree_key = f"tree_base_{st.session_state.click_counter}"
+            if tree_key not in st.session_state:
+                base_newick, pd_score, base_insight, used_taxa = build_phylogenetic_tree(
+                    species_list, num_sequences, "Clicked Location", clicked_lat, clicked_lon
+                )
+                st.session_state[tree_key] = {
+                    "base_newick": base_newick,
+                    "pd_score": pd_score,
+                    "used_taxa": used_taxa
+                }
+            else:
+                cached = st.session_state[tree_key]
+                base_newick = cached["base_newick"]
+                pd_score = cached["pd_score"]
+                used_taxa = cached["used_taxa"]
+            if base_newick:
+                # Load base tree (with scientific names)
+                tree_io = io.StringIO(base_newick)
+                tree = Phylo.read(tree_io, "newick")
+                # Get leaf order based on scientific names
+                leaf_order = [term.name for term in tree.get_terminals()]
+                # Create mapping from scientific to selected label
+                sci_to_label = {}
+                for taxon, colloquial, ncbi_id in used_taxa:
+                    if label_type == "Common Name":
+                        label = f"{colloquial} ({taxon})" if colloquial != 'Unknown' else taxon
+                    elif label_type == "NCBI Accession":
+                        label = ncbi_id
+                    else:
+                        label = taxon
+                    sci_to_label[taxon] = label
+                # Relabel terminals
+                for term in tree.get_terminals():
+                    sci_name = term.name
+                    if sci_name in sci_to_label:
+                        term.name = sci_to_label[sci_name]
+                # Write new newick
+                output = io.StringIO()
+                Phylo.write(tree, output, 'newick')
+                newick = output.getvalue().strip()
+                # Update insight with new labels
+                divergence_insight = f"Tree built from COI sequences of {', '.join([term.name for term in tree.get_terminals()])}"
+                label_to_sci = {v: k for k, v in sci_to_label.items()}
+                tree_img = render_tree_with_images(newick, "Phylogenetic Tree at Clicked Location", sci_to_label)
                 st.write(f"Phylogenetic Diversity: {pd_score:.1f}")
                 st.write(divergence_insight)
-                # Display images and descriptive text for used taxa
-                if used_taxa:
-                    with st.expander("Species Images and Details"):
-                        cols = st.columns(3)
-                        for i, (taxon, colloquial, ncbi_id) in enumerate(used_taxa):
-                            img_url = get_species_image(taxon)
-                            with cols[i % 3]:
-                                if img_url:
-                                    st.image(img_url, caption=f"{taxon} ({colloquial}) - NCBI: {ncbi_id}")
-                                else:
-                                    st.write(f"{taxon} ({colloquial}) - NCBI: {ncbi_id} (No image found)")
+                if tree_img:
+                    st.image(tree_img)
             clicked_cluster = MarkerCluster(name="Clicked Occurrences").add_to(click_layer)
             for occ in occ_list:
                 folium.Marker(
@@ -901,7 +922,6 @@ if map_output and map_output.get("last_clicked"):
             "PD Score": pd_score
         })
     st_folium(m, width=700, height=500, returned_objects=["last_clicked"], key=f"main_map_{st.session_state.click_counter}")
-
 # Search by location or species
 st.subheader("Explore Evolution by Location or Species")
 search = st.text_input("Enter a location or species (e.g., 'Great Barrier Reef' or 'Mola mola')")
@@ -950,33 +970,67 @@ if search:
             )
             if num_sequences > 20:
                 st.warning(f"Fetching {num_sequences} sequences may take several minutes. Please be patient.")
-            newick, pd_score, divergence_insight, used_taxa = build_phylogenetic_tree(
-                species_list, num_sequences, search, lat if 'lat' in locals() else None, lon if 'lon' in locals() else None, label_type
-            )
-            if newick:
-                tree_img = render_tree(newick, f"Evolution for {search}")
-                if tree_img:
-                    st.image(tree_img, caption=f"Phylogenetic tree showing evolutionary flow for {search}")
+            # For search, use a simple cache based on search term
+            if 'last_search' not in st.session_state or st.session_state.last_search != search:
+                st.session_state.last_search = search
+                st.session_state.search_tree_base = None
+            tree_key = "search_tree_base"
+            if st.session_state.get(tree_key) is None:
+                lat = coord[0] if 'coord' in locals() and coord else None
+                lon = coord[1] if 'coord' in locals() and coord else None
+                base_newick, pd_score, base_insight, used_taxa = build_phylogenetic_tree(
+                    species_list, num_sequences, search, lat, lon
+                )
+                st.session_state[tree_key] = {
+                    "base_newick": base_newick,
+                    "pd_score": pd_score,
+                    "used_taxa": used_taxa
+                }
+            else:
+                cached = st.session_state[tree_key]
+                base_newick = cached["base_newick"]
+                pd_score = cached["pd_score"]
+                used_taxa = cached["used_taxa"]
+            if base_newick:
+                # Load base tree (with scientific names)
+                tree_io = io.StringIO(base_newick)
+                tree = Phylo.read(tree_io, "newick")
+                # Get leaf order based on scientific names
+                leaf_order = [term.name for term in tree.get_terminals()]
+                # Create mapping from scientific to selected label
+                sci_to_label = {}
+                for taxon, colloquial, ncbi_id in used_taxa:
+                    if label_type == "Common Name":
+                        label = f"{colloquial} ({taxon})" if colloquial != 'Unknown' else taxon
+                    elif label_type == "NCBI Accession":
+                        label = ncbi_id
+                    else:
+                        label = taxon
+                    sci_to_label[taxon] = label
+                # Relabel terminals
+                for term in tree.get_terminals():
+                    sci_name = term.name
+                    if sci_name in sci_to_label:
+                        term.name = sci_to_label[sci_name]
+                # Write new newick
+                output = io.StringIO()
+                Phylo.write(tree, output, 'newick')
+                newick = output.getvalue().strip()
+                # Update insight with new labels
+                divergence_insight = f"Tree built from COI sequences of {', '.join([term.name for term in tree.get_terminals()])}"
+                label_to_sci = {v: k for k, v in sci_to_label.items()}
+                tree_img = render_tree_with_images(newick, f"Evolution for {search}", sci_to_label)
                 st.write(f"Species Count: {len(species_list)}")
                 st.write(f"Phylogenetic Diversity (PD): {pd_score:.1f}")
                 st.markdown(f"**Evolutionary Insight**: {divergence_insight}")
-                # Display images and descriptive text for used taxa
-                if used_taxa:
-                    with st.expander("Species Images and Details"):
-                        cols = st.columns(3)
-                        for i, (taxon, colloquial, ncbi_id) in enumerate(used_taxa):
-                            img_url = get_species_image(taxon)
-                            with cols[i % 3]:
-                                if img_url:
-                                    st.image(img_url, caption=f"{taxon} ({colloquial}) - NCBI: {ncbi_id}")
-                                else:
-                                    st.write(f"{taxon} ({colloquial}) - NCBI: {ncbi_id} (No image found)")
+                if tree_img:
+                    st.image(tree_img, caption=f"Phylogenetic tree showing evolutionary flow for {search}")
             if st.button(f"Fetch Gene Sequences (COI) for Top {num_sequences} Taxa"):
                 # Use species_list and filter valid species, as done in build_phylogenetic_tree
                 valid_species = [s for s in species_list if s != 'Unknown' and is_species_level(s)]
                 if not valid_species:
                     valid_species = [s for s in species_list if s != 'Unknown']
-              
+           
                 sequences = []
                 failed_taxa = []
                 progress_bar = st.progress(0)
@@ -1024,8 +1078,8 @@ if search:
                     st.write("No sequences found.")
         else:
             st.write(f"No data found for '{search}'. Please try another location or species.")
-          
-          
+       
+       
 # Footer and notes
 st.markdown("""
 **Evolution in Focus**: Explore how ocean features drive marine speciation and genetic adaptations. Click green markers or near blue occurrence points (indicating OBIS data) for real phylogenetic trees. The red polygon shows your search area. Toggle coral reefs or stats for more insights!
