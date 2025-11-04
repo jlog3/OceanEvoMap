@@ -26,7 +26,14 @@ from functools import lru_cache
 import re
 import logging # Add this if not present
 from Bio.Align import PairwiseAligner # Ensure imported for fallback
+from pygbif import occurrences as gbif_occ
 import urllib3; urllib3.disable_warnings()
+import urllib.parse
+from branca.element import MacroElement
+from jinja2 import Template
+import json
+from dotenv import load_dotenv  # Add this if you haven't already, to load your .env file
+load_dotenv()  # Call it early in the script
 
 # Temporary patch for pyobis logging bug: Redirect tqdm output to avoid invalid kwargs
 class TqdmLoggingHandler(logging.Handler):
@@ -39,12 +46,42 @@ class TqdmLoggingHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+# Add scale
+class ScaleControl(MacroElement):
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+            L.control.scale({{this.options}}).addTo({{this._parent.get_name()}});
+        {% endmacro %}
+        """)
+    def __init__(self, position='bottomleft', imperial=False, metric=True, **kwargs):
+        super().__init__()
+        self._name = 'ScaleControl'
+        options = {
+            'position': position,
+            'imperial': imperial,
+            'metric': metric
+        }
+        options.update(kwargs)
+        self.options = json.dumps(options)
+
+# Custom AttributionControl class
+class AttributionControl(MacroElement):
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+            L.control.attribution({position: 'bottomleft'}).addTo({{this._parent.get_name()}});
+        {% endmacro %}
+    """)
+
+
+
 # In your app setup, after imports:
 logger = logging.getLogger('pyobis')
 logger.addHandler(TqdmLoggingHandler())
 logger.propagate = False # Prevent double-logging
-Entrez.email = os.getenv("ENTREZ_EMAIL", st.text_input("Enter your email for NCBI Entrez"))
+email_default = os.getenv("ENTREZ_EMAIL", "")
+Entrez.email = st.text_input("Enter your email for NCBI Entrez", value=email_default)
 Entrez.api_key = os.getenv("ENTREZ_API_KEY")
+
 # Streamlit UI setup
 st.title("Ocean Layers: Seafloor & Evolution Explorer")
 st.markdown("Explore seafloor bathymetry, coral reefs, and evolutionary patterns of marine life. Click near blue occurrence points or search for real phylogenetic trees!")
@@ -62,7 +99,7 @@ license_links = {
     "CC4": "https://creativecommons.org/licenses/by/4.0/",
     "CC3":"https://creativecommons.org/licenses/by-sa/3.0/",
     "CC2": "https://creativecommons.org/licenses/by-sa/2.0/",
-    "Public Domain":"",
+    "public domain":"",
     "GNU":"https://commons.wikimedia.org/wiki/GNU_Free_Documentation_License", # GNU Free Documentation License
     "researchgate": ""
 }
@@ -73,24 +110,32 @@ license_links = {
                 #"sourcelink": "Schokraie E, Warnken U, Hotz-Wagenblatt A, Grohme MA, Hengherr S, et al. (2012) Comparative proteome analysis of Milnesium tardigradum in early embryonic state versus adults in active and anhydrobiotic state. PLoS ONE 7(9): e45682. doi:10.1371/journal.pone.0045682",
                 #"license": "CC2"
 
+# some phyla in your list (e.g., Acoelomorpha and Xenoturbellida) are classified under the phylum Xenacoelomorpha in GBIF's backbone taxonomy—use key '7190138' for both
+
 phylum_info = {
     'Acanthocephala': {
         'description': 'Parasitic worms characterized by an eversible spiny proboscis for attaching to hosts; they lack a digestive tract and absorb nutrients through their body surface, with complex life cycles involving intermediate and definitive hosts.',
+        'rarity': 'Rare', # ~10K records
         'habitable_areas': 'Marine and freshwater systems as parasites; often in crustacean intermediate hosts and fish/seabird definitive hosts in coastal and open ocean environments.',
         'representative_species': 'Polymorphus paradoxus (no common name; parasitizes seabirds); Corynosoma wegeneri (no common name; marine parasite)',
         'vernacular': 'Thorny-headed worms',
+        'gbif_taxon_id': '67',
+        'hotspots': [
+            {"lat": 44.65, "lon": -63.57, "region": "Halifax, Canada (Lobster Habitats)"},
+            {"lat": 22.63, "lon": 120.27, "region": "Kaohsiung, Taiwan (Red Snapper Habitats)"}
+        ],
         'images': [
             {
                 "file": "Polymorphus.png",
-                "species": "Polymorphus", # genus species ; genus 
+                "species": "Polymorphus",
                 "vernacular": "thorny-headed worm",
-                "description": "", 
-                "attribution": "By Unknown author - https://pubmed.ncbi.nlm.nih.gov/37874424/, CC BY 4.0, https://commons.wikimedia.org/w/index.php?curid=162149367", # wikipedia
-                "location": None, # optional
+                "description": "",
+                "attribution": "By Unknown author - https://pubmed.ncbi.nlm.nih.gov/37874424/, CC BY 4.0, https://commons.wikimedia.org/w/index.php?curid=162149367",
+                "location": None,
                 "camera_coordinates": "",
                 "date": "",
-                "author": "Unknown", # optional
-                "sourcelink": "",  # optional
+                "author": "Unknown",
+                "sourcelink": "",
                 "license": "CC4",
             },
             {
@@ -111,8 +156,13 @@ phylum_info = {
     'Acoelomorpha': {
         'description': 'Simple, small soft-bodied animals lacking a gut or body cavity, with one opening for digestion/excretion; they are hermaphrodites with a basic nervous system and sensory organs.',
         'habitable_areas': 'Primarily marine or brackish waters, living in sediment grains, as plankton, or on algae/corals; mostly in coastal and shallow marine zones.',
+        'rarity': 'Rare',  # <10K records        
         'representative_species': 'Waminoa sp. (no common name; found on corals); Symsagittifera roscoffensis (mint flatworm)',
         'vernacular': 'Acoelomorph flatworms',
+        'gbif_taxon_id': '7190138',
+        'hotspots': [
+            {"lat": 3.25, "lon": 73, "region": "Maldives, Indian Ocean"}
+        ],
         'images': [
             {
                 "file": "Acoel_Flatworms_(Waminoa_sp.)_on_Bubble_Coral_(Plerogyra_sinuosa)_-_Panglima,_Pulau_Mabul,_Sabah,_Malaysia.jpg",
@@ -156,8 +206,17 @@ phylum_info = {
     'Annelida': {
         'description': 'Bilaterally symmetrical, segmented invertebrates with a coelom, circular segments, and chaetae (bristles) for movement; they have a closed circulatory system and diverse feeding strategies.',
         'habitable_areas': 'Predominantly marine, in tidal zones, hydrothermal vents, coral reefs, and seafloor sediments; polychaetes dominate marine benthic communities.',
+        'rarity': 'Common',  # >1M records (e.g., ~800K in GBIF proxy, likely similar in OBIS)        
         'representative_species': 'Nereis (ragworm); Hirudo medicinalis (medicinal leech)',
         'vernacular': 'Segmented worms',
+        'gbif_taxon_id': '42',
+        'hotspots': [
+            {"lat": 9.83, "lon": -104.3, "region": "East Pacific Rise (Hydrothermal Vents)"},
+            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef (Coral Reefs)"},
+            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean (Coral Reefs)"},
+            {"lat": 36.8, "lon": -122.0, "region": "Monterey Bay (Tidal Zones)"},
+            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Bay (Marine Habitats)"}
+        ],
         'images': [
             {
                 "file": "Nereididae_(YPM_IZ_035344).jpeg",
@@ -192,8 +251,19 @@ phylum_info = {
     'Arthropoda': {
         'description': 'Invertebrates with a chitinous exoskeleton, segmented bodies, jointed appendages, and an open circulatory system; they moult to grow and exhibit high diversity.',
         'habitable_areas': 'Marine ecosystems worldwide, including oceans, deep-sea trenches, and coastal areas; crustaceans are mostly aquatic in marine settings.',
+        'rarity': 'Common',  # >10M records        
         'representative_species': 'Macrocheira kaempferi (Japanese spider crab); Homarus americanus (American lobster)',
         'vernacular': 'Arthropods',
+        'gbif_taxon_id': '54',
+        'hotspots': [
+            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef (Crustacean Diversity)"},
+            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean (Lobster Habitats)"},
+            {"lat": -34.93, "lon": 138.6, "region": "Adelaide Coast, South Australia"},
+            {"lat": 22.63, "lon": 120.27, "region": "South China Sea (Marine Arthropods)"},
+            {"lat": 49.25, "lon": -123.12, "region": "Vancouver Coast, British Columbia"},
+            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctica (Deep Sea)"},
+            {"lat": -23.65, "lon": -70.4, "region": "Antofagasta, Chile (Coastal)"}
+        ],
         'images': [
             {
                 "file": "Macrocheira_kaempferi_01.jpg",
@@ -226,11 +296,19 @@ phylum_info = {
         ]
     },
     'Brachiopoda': {
-# description: https://www.oist.jp/news-center/press-releases/%E2%80%9Cliving-fossil%E2%80%9D-genome-decoded
         'description': 'Marine animals with hinged dorsal-ventral shells and a lophophore for filter-feeding; divided into articulate (toothed hinges) and inarticulate types.',
         'habitable_areas': 'Exclusively marine, in rocky overhangs, caves, continental slopes, and deep ocean floors; prefer cold, low-light waters.',
+        'rarity': 'Medium',    # ~50K-100K records      
         'representative_species': 'Lingula anatina (lingulid brachiopod); Terebratalia transversa (no common name)',
         'vernacular': 'Lamp shells',
+        'gbif_taxon_id': '110',
+        'hotspots': [
+            {"lat": 43, "lon": 131, "region": "Sea of Japan"},
+            {"lat": -23.65, "lon": -70.4, "region": "Antofagasta, Northern Chile"},
+            {"lat": 12.4, "lon": 102.52, "region": "Trat Province, Thailand (Mangroves)"},
+            {"lat": -18.14, "lon": 178.44, "region": "Suva, Fiji"},
+            {"lat": 35.1, "lon": 139.08, "region": "Japan Coastal"}
+        ],
         'images': [
             {
                 "file": "Lingula-Photo.jpg",
@@ -263,12 +341,22 @@ phylum_info = {
         ]
     },
     'Bryozoa': {
-# https://www.nzgeo.com/stories/living-lace/
-# Distribution data sourced from the Atlas of Living Australia    https://www.ala.org.au/
         'description': 'Aquatic colonial invertebrates with a lophophore for filter-feeding; colonies consist of interconnected zooids, often encrusting or erect.',
         'habitable_areas': 'Mostly marine in tropical to polar waters, on hard substrates like rocks, shells, and algae; common in coral reefs and deeper seas.',
+        'rarity': 'Medium',  # ~200K records        
         'representative_species': 'Membranipora membranacea (marine lace-like bryozoan); Bugula neritina (no common name)',
         'vernacular': 'Moss animals',
+        'gbif_taxon_id': '53',
+        'hotspots': [
+            {"lat": 43, "lon": -69, "region": "Gulf of Maine"},
+            {"lat": 47.61, "lon": -122.33, "region": "Seattle, US Northwest Coast"},
+            {"lat": 78, "lon": 16, "region": "Svalbard, Arctic"},
+            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"},
+            {"lat": 20.6, "lon": -16.25, "region": "Banc d'Arguin, Mauritania"},
+            {"lat": 35.12, "lon": 33.43, "region": "Cyprus, Mediterranean"},
+            {"lat": 35.53, "lon": 129.03, "region": "South Africa Coastal"},
+            {"lat": 12.4, "lon": 102.52, "region": "Trat Province, Thailand"}
+        ],
         'images': [
             {
                 "file": "5cf5df6e5ee161cf03587aba201dcb98.jpg",
@@ -303,8 +391,20 @@ phylum_info = {
     'Chaetognatha': {
         'description': 'Predatory marine worms with a torpedo-shaped body, grasping spines, and fins; they are transparent and planktonic.',
         'habitable_areas': 'All marine waters worldwide, from surface to deep sea and polar regions; primarily pelagic as plankton.',
+        'rarity': 'Medium',   # ~50K records       
         'representative_species': 'Sagitta elegans (common arrow worm); Eukrohnia hamata (polar arrow worm)',
         'vernacular': 'Arrow worms',
+        'gbif_taxon_id': '55',
+        'hotspots': [
+            {"lat": 75, "lon": -150, "region": "Canada Basin, Arctic"},
+            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"},
+            {"lat": -30, "lon": -30, "region": "South Atlantic"},
+            {"lat": 35.17, "lon": 129.03, "region": "Busan, Korean Waters"},
+            {"lat": 44, "lon": 35, "region": "Black Sea"},
+            {"lat": 35, "lon": 30, "region": "Eastern Mediterranean"},
+            {"lat": 55, "lon": 3, "region": "North Sea"},
+            {"lat": 57, "lon": 20, "region": "Baltic Sea"}
+        ],
         'images': [
             {
                 "file": "Chaetognatha.png",
@@ -339,8 +439,20 @@ phylum_info = {
     'Chordata': {
         'description': 'Animals with a notochord, dorsal nerve cord, pharyngeal slits, and post-anal tail at some life stage; includes vertebrates and invertebrate subphyla like tunicates.',
         'habitable_areas': 'Diverse, but marine focus includes seafloor sediments for lancelets and sessile/ pelagic for tunicates in oceans worldwide.',
+        'rarity': 'Common',  # >5M records
         'representative_species': 'Branchiostoma lanceolatum (lancelet); Ascidia sp. (sea squirt)',
         'vernacular': 'Chordates',
+        'gbif_taxon_id': '44',
+        'hotspots': [
+            {"lat": 22.63, "lon": 120.27, "region": "South China Sea"},
+            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef (Marine Diversity)"},
+            {"lat": 30, "lon": -60, "region": "Sargasso Sea (Fish Diversity)"},
+            {"lat": -0.5, "lon": -90.5, "region": "Galápagos"},
+            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean"},
+            {"lat": 50, "lon": -30, "region": "North Atlantic"},
+            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"},
+            {"lat": -63.38, "lon": -57, "region": "Antarctic Peninsula"}
+        ],
         'images': [
             {
                 "file": "Branchiostoma_lanceolatum.jpg",
@@ -375,8 +487,18 @@ phylum_info = {
     'Cnidaria': {
         'description': 'Aquatic invertebrates with stinging cells (cnidocytes) and radial symmetry; exist as polyps or medusae, often colonial.',
         'habitable_areas': 'Predominantly marine in shallow tropical waters, deep seas, and polar regions; common in coral reefs and open ocean.',
+        'rarity': 'Common',  # >1M records
         'representative_species': 'Chrysaora fuscescens (Pacific sea nettle); Physalia physalis (Portuguese man o\' war)',
         'vernacular': 'Cnidarians',
+        'gbif_taxon_id': '43',
+        'hotspots': [
+            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
+            {"lat": -0.5, "lon": -90.5, "region": "Galápagos (Coral/Anemone Spot)"},
+            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean (Coral Reefs)"},
+            {"lat": 3.25, "lon": 73, "region": "Maldives, Indian Ocean (Tropical Reefs)"},
+            {"lat": 9.83, "lon": -104.3, "region": "East Pacific Rise (Hydrothermal Vents)"},
+            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic (Polar Seabeds)"}
+        ],
         'images': [
             {
                 "file": "west-coast-sea-nettle-2.jpg",
@@ -411,8 +533,19 @@ phylum_info = {
     'Ctenophora': {
         'description': 'Marine invertebrates with comb-like cilia for swimming and sticky colloblasts for prey capture; gelatinous and predatory.',
         'habitable_areas': 'Sea waters worldwide, from polar to tropical, near coasts to deep ocean; mostly planktonic.',
+        'rarity': 'Medium',  # ~10K-50K records
         'representative_species': 'Mnemiopsis leidyi (sea walnut); Pleurobrachia bachei (sea gooseberry)',
         'vernacular': 'Comb jellies',
+        'gbif_taxon_id': '51',
+        'hotspots': [
+            {"lat": 44, "lon": 35, "region": "Black Sea"},
+            {"lat": 46, "lon": 35, "region": "Sea of Azov"},
+            {"lat": 35, "lon": 30, "region": "Eastern Mediterranean"},
+            {"lat": 55, "lon": 3, "region": "North Sea"},
+            {"lat": 57, "lon": 20, "region": "Baltic Sea"},
+            {"lat": 78, "lon": 16, "region": "Svalbard, Arctic"},
+            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"}
+        ],
         'images': [
             {
                 "file": "Sea_walnut,_Boston_Aquarium_(cropped).jpg",
@@ -447,10 +580,16 @@ phylum_info = {
     'Cycliophora': {
         'description': 'Commensal aquatic animals with sac-like bodies and complex life cycles; highly specialized and microscopic.',
         'habitable_areas': 'Marine, commensal on mouthparts of cold-water lobsters in North Atlantic and Mediterranean.',
+        'rarity': 'Rare', # <100 records (only 2-3 species)
         'representative_species': 'Symbion pandora (no common name); Symbion americanus (no common name)',
         'vernacular': 'No common name (genus Symbion)',
+        'gbif_taxon_id': '45',
+        'hotspots': [
+            {"lat": 50, "lon": -30, "lon": "North Atlantic"},
+            {"lat": 40, "lon": 15, "region": "Mediterranean"}
+        ],
         'images': [
-            { # http://www.microscopy-uk.org.uk/mag/indexmag.html?http://www.microscopy-uk.org.uk/mag/articles/pandora.html
+            {
                 "file": "CYC-000075_hab_Symbion_pandora_Paratype.tif.jpg",
                 "species": "Symbion pandora",
                 "vernacular": "",
@@ -483,8 +622,17 @@ phylum_info = {
     'Echinodermata': {
         'description': 'Marine animals with radial symmetry, water vascular system, and calcareous endoskeleton; include starfish, urchins, etc.',
         'habitable_areas': 'Exclusively marine, from intertidal to abyssal depths worldwide; common on seabeds and coral reefs.',
+        'rarity': 'Common',  # >500K records
         'representative_species': 'Fromia indica (starfish); Actinopyga echinites (sea cucumber)',
         'vernacular': 'Echinoderms',
+        'gbif_taxon_id': '50',
+        'hotspots': [
+            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
+            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean"},
+            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic (Deep Sea)"},
+            {"lat": 28.03, "lon": -111.77, "region": "Gulf of California"},
+            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Bay"}
+        ],
         'images': [
             {
                 "file": "Starfish_montage.png",
@@ -519,8 +667,14 @@ phylum_info = {
     'Entoprocta': {
         'description': 'Sessile aquatic animals with a goblet shape, crown of tentacles, and both mouth/anus inside the crown; mostly colonial.',
         'habitable_areas': 'Marine oceans on rocks, shells, algae; mostly shallow to 50m, some deep sea.',
+        'rarity': 'Rare',  # <10K records
         'representative_species': 'Barentsia ramosa (no common name); Pedicellina cernua (no common name)',
         'vernacular': 'Kamptozoa',
+        'gbif_taxon_id': '8173593',
+        'hotspots': [
+            {"lat": -63.38, "lon": -57, "region": "Antarctic Peninsula"},
+            {"lat": 65.5, "lon": 38, "region": "White Sea"}
+        ],
         'images': [
             {
                 "file": "medium.jpeg",
@@ -555,8 +709,14 @@ phylum_info = {
     'Gastrotricha': {
         'description': 'Microscopic cylindrical animals with cilia, adhesive glands, and a muscular pharynx; hermaphrodites.',
         'habitable_areas': 'Marine sediments and interstitial spaces; benthic in sands and seabeds worldwide.',
+        'rarity': 'Rare',  # <10K records
         'representative_species': 'Thaumastoderma ramuliferum (no common name); Lepidodermella squamatum (no common name)',
         'vernacular': 'Hairybellies or hairybacks',
+        'gbif_taxon_id': '22',
+        'hotspots': [
+            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"},
+            {"lat": 42.12, "lon": 15.5, "region": "Tremiti Archipelago, Adriatic"}
+        ],
         'images': [
             {
                 "file": "Thaumastoderma_ramuliferum.jpg",
@@ -591,8 +751,14 @@ phylum_info = {
     'Gnathostomulida': {
         'description': 'Microscopic marine animals with cuticular jaws, no body cavity, and simultaneous hermaphroditism.',
         'habitable_areas': 'Shallow coastal sands and muds; anoxic-tolerant benthic environments.',
+        'rarity': 'Rare',  # <1K records
         'representative_species': 'Gnathostomula paradoxa (no common name)',
         'vernacular': 'Jaw worms',
+        'gbif_taxon_id': '77',
+        'hotspots': [
+            {"lat": 58.94, "lon": 20.13, "region": "Baltic Sea (Interstitial Jaw Worm Habitats)"},
+            {"lat": 15.33, "lon": -76.16, "region": "Caribbean Sea (Shallow Coastal Gnathostomulid Spot)"}
+        ],
         'images': [
             {
                 "file": "fig028.jpg",
@@ -627,8 +793,14 @@ phylum_info = {
     'Hemichordata': {
         'description': 'Marine deuterostomes with a proboscis, collar, and trunk; filter or deposit feeders.',
         'habitable_areas': 'Marine sediments and deep-sea; burrowing or colonial in oceans worldwide.',
+        'rarity': 'Medium',  # ~10K records
         'representative_species': 'Saccoglossus kowalevskii (acorn worm); Cephalodiscus nigrescens (no common name)',
         'vernacular': 'Hemichordates (acorn worms, pterobranchs)',
+        'gbif_taxon_id': '75',
+        'hotspots': [
+            {"lat": 50.37, "lon": -4.14, "region": "Plymouth, England"},
+            {"lat": 32.3, "lon": -64.79, "region": "Bermuda"}
+        ],
         'images': [
             {
                 "file": "Enteropneusta.png",
@@ -663,8 +835,14 @@ phylum_info = {
     'Kinorhyncha': {
         'description': 'Small segmented marine invertebrates with a spiny introvert for locomotion; meiobenthic.',
         'habitable_areas': 'Marine mud and sand at all depths worldwide.',
+        'rarity': 'Rare',  # <10K records
         'representative_species': 'Echinoderes hwiizaa (no common name); Echinoderes spinifurca (no common name)',
         'vernacular': 'Mud dragons',
+        'gbif_taxon_id': '5959089',
+        'hotspots': [
+            {"lat": 7.34, "lon": -128.69, "region": "Clarion-Clipperton Fracture Zone (Abyssal Mud Dragon Habitats)"},
+            {"lat": 11.2, "lon": 95.66, "region": "Andaman Sea (Intertidal Kinorhynch Diversity)"}
+        ],
         'images': [
             {
                 "file": "Echinoderes_hwiizaa.jpg",
@@ -699,8 +877,16 @@ phylum_info = {
     'Loricifera': {
         'description': 'Microscopic sediment-dwellers with a protective lorica and complex life cycles; anoxia-tolerant.',
         'habitable_areas': 'Marine sediments from shallow to deep sea; often in anoxic basins.',
+        'rarity': 'Rare',  # <1K records (29 species)
         'representative_species': 'Pliciloricus enigmaticus (no common name); Spinoloricus cinziae (no common name)',
         'vernacular': 'No common name',
+        'gbif_taxon_id': '5967457',
+        'hotspots': [
+            {"lat": 35.18, "lon": 21.41, "region": "L'Atalante Basin, Mediterranean"},
+            {"lat": 30, "lon": -28.5, "region": "Great Meteor Seamount, Atlantic"},
+            {"lat": 48.72, "lon": -3.99, "region": "Roscoff, France"},
+            {"lat": 61.89, "lon": -6.91, "region": "Faroe Bank, North Atlantic"}
+        ],
         'images': [
             {
                 "file": "Pliciloricus_enigmatus.jpg",
@@ -735,8 +921,18 @@ phylum_info = {
     'Mollusca': {
         'description': 'Soft-bodied invertebrates with a mantle, radula, and often a shell; diverse classes like gastropods, bivalves.',
         'habitable_areas': 'Largest marine phylum; oceans worldwide from shores to abyssal zones.',
+        'rarity': 'Common',  # >3M records
         'representative_species': 'Nautilus pompilius (Nautilus pompilius); Ruditapes philippinarum (Manila clam)',
         'vernacular': 'Mollusks',
+        'gbif_taxon_id': '52',
+        'hotspots': [
+            {"lat": 28.03, "lon": -111.77, "region": "Gulf of California"},
+            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
+            {"lat": -34.93, "lon": 138.6, "region": "Adelaide, South Australia"},
+            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Bay"},
+            {"lat": 21.31, "lon": -157.86, "region": "Honolulu, Hawaii (Pacific)"},
+            {"lat": 49.25, "lon": -123.12, "region": "Vancouver Coast"}
+        ],
         'images': [
             {
                 "file": "Nautilus_belauensis_from_Palau.jpg",
@@ -771,8 +967,15 @@ phylum_info = {
     'Nematoda': {
         'description': 'Slender unsegmented worms with a cuticle and tubular gut; free-living or parasitic.',
         'habitable_areas': 'Abundant in marine sediments and ocean floors; meiobenthic worldwide.',
+        'rarity': 'Medium',  # ~200K records
         'representative_species': 'Caenorhabditis elegans (model roundworm); Ascaris lumbricoides (human roundworm)',
         'vernacular': 'Roundworms',
+        'gbif_taxon_id': '5967481',
+        'hotspots': [
+            {"lat": 55, "lon": 3, "region": "North Sea (Ocean Floor)"},
+            {"lat": 57, "lon": 20, "region": "Baltic Sea"},
+            {"lat": 44, "lon": 35, "region": "Black Sea"}
+        ],
         'images': [
             {
                 "file": "merlin_157432140_f91af05d-c96a-454b-8d2c-c0d75e238478-jumbo.webp",
@@ -807,8 +1010,14 @@ phylum_info = {
     'Nematomorpha': {
         'description': 'Parasitoid worms similar to nematodes; larvae parasitic on arthropods, adults free-living.',
         'habitable_areas': 'Marine (planktonic adults, parasitic larvae in crustaceans); some freshwater.',
+        'rarity': 'Rare',  # <1K records
         'representative_species': 'Paragordius tricuspidatus (no common name); Nectonema sp. (no common name)',
         'vernacular': 'Horsehair worms or Gordian worms',
+        'gbif_taxon_id': '64',
+        'hotspots': [
+            {"lat": 34.55, "lon": 18.05, "region": "Mediterranean Sea (Marine Horsehair Worm Habitats)"},
+            {"lat": 31.78, "lon": -40.25, "region": "North Atlantic Ocean (Pelagic Nematomorpha Spot)"}
+        ],
         'images': [
             {
                 "file": "Paragordius_tricuspidatus.jpeg",
@@ -843,8 +1052,17 @@ phylum_info = {
     'Nemertea': {
         'description': 'Unsegmented worms with an eversible venomous proboscis; carnivorous.',
         'habitable_areas': 'Mostly marine in sediments, crevices, and open ocean; some pelagic.',
+        'rarity': 'Medium',  # ~50K records
         'representative_species': 'Lineus longissimus (bootlace worm); Carcinonemertes errans (no common name)',
         'vernacular': 'Ribbon worms or proboscis worms',
+        'gbif_taxon_id': '63',
+        'hotspots': [
+            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Coastal"},
+            {"lat": 21.31, "lon": -157.86, "region": "Honolulu, Hawaii"},
+            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"},
+            {"lat": 55, "lon": 3, "region": "North Sea"},
+            {"lat": 28.03, "lon": -111.77, "region": "Gulf of California"}
+        ],
         'images': [
             {
                 "file": "Lineus_longissimus_retouched.jpg",
@@ -879,8 +1097,14 @@ phylum_info = {
     'Orthonectida': {
         'description': 'Simple multicellular parasites with ciliated cells; wormlike and microscopic.',
         'habitable_areas': 'Marine, parasitic in invertebrates like flatworms and mollusks.',
+        'rarity': 'Rare',  # <100 records
         'representative_species': 'Rhopalura ophiocomae (no common name); Intoshia linei (no common name)',
         'vernacular': 'Orthonectids',
+        'gbif_taxon_id': '5967456',
+        'hotspots': [
+            {"lat": 65.65, "lon": 36.85, "region": "White Sea (Parasitic Orthonectid Habitats)"},
+            {"lat": 47.6, "lon": -122.45, "region": "Puget Sound (Invertebrate Host Diversity)"}
+        ],
         'images': [
             {
                 "file": "Rhopalura.jpg",
@@ -915,8 +1139,17 @@ phylum_info = {
     'Phoronida': {
         'description': 'Tube-dwelling filter-feeders with a lophophore; U-shaped gut.',
         'habitable_areas': 'Marine sediments, rocks, and shells; intertidal to 400m depth worldwide.',
+        'rarity': 'Medium',  # ~10K records
         'representative_species': 'Phoronis sp. (horseshoe worm); Phoronopsis harmeri (no common name)',
         'vernacular': 'Horseshoe worms',
+        'gbif_taxon_id': '19',
+        'hotspots': [
+            {"lat": 65.5, "lon": 38, "region": "White Sea, Arctic"},
+            {"lat": -23.65, "lon": -70.4, "region": "California Coastal"},
+            {"lat": 43, "lon": 131, "region": "Sea of Japan"},
+            {"lat": 22.63, "lon": 120.27, "region": "South China Sea"},
+            {"lat": 21.31, "lon": -157.86, "region": "Hawaii"}
+        ],
         'images': [
             {
                 "file": "Phoronis_hippocrepia_2_Wright,_1856.jpg",
@@ -951,8 +1184,16 @@ phylum_info = {
     'Placozoa': {
         'description': 'Simple blob-like cell aggregations; no tissues or organs, feed by engulfment.',
         'habitable_areas': 'Marine seafloors and benthic zones globally.',
+        'rarity': 'Rare',  # <100 records
         'representative_species': 'Trichoplax adhaerens (no common name); Hoilungia hongkongensis (no common name)',
         'vernacular': 'Flat animals',
+        'gbif_taxon_id': '76',
+        'hotspots': [
+            {"lat": 35.1, "lon": 139.08, "region": "Seto Inland Sea, Japan"},
+            {"lat": 22.36, "lon": 114.11, "region": "Hong Kong"},
+            {"lat": 40.64, "lon": 14.38, "region": "Naples, Italy"},
+            {"lat": 35.18, "lon": 21.41, "region": "Mediterranean"}
+        ],
         'images': [
             {
                 "file": "Trichoplax_adhaerens_photograph.png",
@@ -987,8 +1228,17 @@ phylum_info = {
     'Platyhelminthes': {
         'description': 'Soft-bodied acoelomates with one digestive opening; free-living or parasitic.',
         'habitable_areas': 'Marine waters as predators/scavengers; parasitic in fish/crustaceans.',
+        'rarity': 'Medium',  # ~100K records
         'representative_species': 'Pseudobiceros hancockanus (sea slug flatworm); Fasciola hepatica (liver fluke)',
         'vernacular': 'Flatworms',
+        'gbif_taxon_id': '108',
+        'hotspots': [
+            {"lat": 14, "lon": 120.97, "region": "Philippines"},
+            {"lat": 3.25, "lon": 73, "region": "Maldives"},
+            {"lat": -36.85, "lon": 174.76, "region": "New Zealand"},
+            {"lat": 13.5, "lon": 144.8, "region": "Guam"},
+            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"}
+        ],
         'images': [
             {
                 "file": "Pseudobiceros_hancockanus.jpg",
@@ -1023,8 +1273,20 @@ phylum_info = {
     'Porifera': {
         'description': 'Porous filter-feeders with no tissues/organs; skeletons of spicules or spongin.',
         'habitable_areas': 'Marine worldwide, from tidal zones to deep sea; on rocks and sediments.',
+        'rarity': 'Common',  # >300K records
         'representative_species': 'Aplysina archeri (stove-pipe sponge); Euplectella aspergillum (Venus\'s flower basket)',
         'vernacular': 'Sponges',
+        'gbif_taxon_id': '105',
+        'hotspots': [
+            {"lat": 36.8, "lon": -122.0, "region": "Monterey Bay (Sponge Habitats)"},
+            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
+            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean"},
+            {"lat": 37.77, "lon": -122.43, "region": "California Deep Waters"},
+            {"lat": 35.18, "lon": 21.41, "region": "Mediterranean Caves"},
+            {"lat": -75, "lon": -175, "region": "Antarctic Regions"},
+            {"lat": 28.03, "lon": -111.77, "region": "Deep Pacific"},
+            {"lat": 29.53, "lon": 35.01, "region": "Northern Red Sea"}
+        ],
         'images': [
             {
                 "file": "Aplysina_archeri_(Stove-pipe_Sponge-pink_variation).jpg",
@@ -1059,8 +1321,15 @@ phylum_info = {
     'Priapulida': {
         'description': 'Unsegmented marine worms with a spiny introvert; carnivorous or detritivorous.',
         'habitable_areas': 'Marine mud/sand from shallow to deep; cold waters up to 13°C.',
+        'rarity': 'Rare',  # <10K records
         'representative_species': 'Priapulus caudatus (cactus worm); Halicryptus spinulosus (no common name)',
         'vernacular': 'Penis worms or priapulid worms',
+        'gbif_taxon_id': '5963150',
+        'hotspots': [
+            {"lat": 60, "lon": -150, "region": "Alaskan Bay"},
+            {"lat": -75, "lon": -175, "region": "Antarctic"},
+            {"lat": -18.14, "lon": 178.44, "region": "Fiji"}
+        ],
         'images': [
             {
                 "file": "Priapulus_caudatus.jpg",
@@ -1095,8 +1364,13 @@ phylum_info = {
     'Rhombozoa': {
         'description': 'Tiny parasites in cephalopod kidneys; simple structure with axial cell and ciliated jacket.',
         'habitable_areas': 'Marine, parasitic in cephalopod renal appendages; temperate benthic zones.',
+        'rarity': 'Rare',  # <100 records
         'representative_species': 'Dicyema japonicum (no common name); Dicyema misakiense (no common name)',
         'vernacular': 'Rhombozoans (or dicyemids)',
+        'gbif_taxon_id': '7663989',
+        'hotspots': [
+            {"lat": 35.1, "lon": 139.08, "region": "Japan (Temperate Benthic)"}
+        ],
         'images': [
             {
                 "file": "Dicyema_japonicum.png",
@@ -1131,8 +1405,14 @@ phylum_info = {
     'Rotifera': {
         'description': 'Microscopic pseudocoelomates with a ciliated corona for feeding/locomotion.',
         'habitable_areas': 'Mostly freshwater, but some marine as zooplankton.',
+        'rarity': 'Medium',  # ~50K records
         'representative_species': 'Brachionus plicatilis (no common name); Bdelloid rotifer (no common name)',
         'vernacular': 'Wheel animals',
+        'gbif_taxon_id': '91',
+        'hotspots': [
+            {"lat": 44.0, "lon": -124.1, "region": "Oregon Coast (Marine Rotifer Habitats)"},
+            {"lat": -18.16, "lon": 147.49, "region": "Great Barrier Reef (Planktonic Rotifer Diversity)"}
+        ],
         'images': [
             {
                 "file": "Brachionus_plicatilis.jpg",
@@ -1167,8 +1447,15 @@ phylum_info = {
     'Sipuncula': {
         'description': 'Unsegmented annelids with a retractable introvert; deposit feeders.',
         'habitable_areas': 'Marine benthic worldwide; burrows in sand/mud, under stones, to abyssal depths.',
+        'rarity': 'Medium',  # ~10K records
         'representative_species': 'Thysanocardia nigra (no common name); Sipunculus nudus (peanut worm)',
         'vernacular': 'Peanut worms or sipunculid worms',
+        'gbif_taxon_id': '74',
+        'hotspots': [
+            {"lat": 21.31, "lon": -157.86, "region": "Hawaii"},
+            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"},
+            {"lat": 37.77, "lon": -122.43, "region": "San Francisco"}
+        ],
         'images': [
             {
                 "file": "Thysanocardia_nigra.jpg",
@@ -1203,8 +1490,14 @@ phylum_info = {
     'Tardigrada': {
         'description': 'Eight-legged micro-animals with extreme resilience via cryptobiosis.',
         'habitable_areas': 'Marine benthic, in sediments and on seaweeds; some deep-sea.',
+        'rarity': 'Medium',  # ~10K records
         'representative_species': 'Milnesium tardigradum (no common name); Halobiotus crispae (no common name)',
         'vernacular': 'Water bears or moss piglets',
+        'gbif_taxon_id': '14',
+        'hotspots': [
+            {"lat": -75, "lon": -175, "region": "Antarctic"},
+            {"lat": 3.25, "lon": 73, "region": "Tropical Rainforests (Marine)"}
+        ],
         'images': [
             {
                 "file": "SEM_image_of_Milnesium_tardigradum_in_active_state_-_journal.pone.0045682.g001-2.png",
@@ -1239,8 +1532,14 @@ phylum_info = {
     'Xenoturbellida': {
         'description': 'Simple bilaterians with a ventral furrow and sac-like gut; no organs except statocyst.',
         'habitable_areas': 'Marine benthic, shallow to deep sea (up to 3700m).',
+        'rarity': 'Rare',  # <100 records
         'representative_species': 'Xenoturbella bocki (no common name); Xenoturbella churro (no common name)',
         'vernacular': 'No common name',
+        'gbif_taxon_id': '7190138',
+        'hotspots': [
+            {"lat": 58.33, "lon": 11.55, "region": "Gullmarsfjorden, Swedish West Coast"},
+            {"lat": 35.1, "lon": 139.08, "region": "Western Pacific, Japan"}
+        ],
         'images': [
             {
                 "file": "Xenoturbella_bocki.jpg",
@@ -1274,9 +1573,11 @@ phylum_info = {
     }
 }
 
+
+
 # Display all phyla images in a grid if no phylum selected
 st.subheader("Step 1: Select a Marine Phylum by Clicking 'Select'")
-num_cols = 5  # Adjust number of columns for grid layout
+num_cols = 5 # Adjust number of columns for grid layout
 selected_phylum = st.session_state.get('selected_phylum', None)
 if not selected_phylum:
     for i in range(0, len(marine_phyla), num_cols):
@@ -1285,48 +1586,47 @@ if not selected_phylum:
             if i + j < len(marine_phyla):
                 phylum = marine_phyla[i + j]
                 images = phylum_info[phylum].get('images', [])
-                
+             
                 if not images:
                     with col:
                         st.warning(f"No images found for {phylum}.")
-                        st.write(phylum)
-                        st.write(phylum_info[phylum]['vernacular'])
+                        st.write(f"{phylum} ({phylum_info[phylum]['vernacular']})")
                         with st.expander("Details"):
                             st.markdown(phylum_info[phylum]['description'])
                         if st.button("Select", key=f"select_{phylum}"):
                             st.session_state.selected_phylum = phylum
                             st.rerun()
                     continue
-                
+             
                 # Initialize index in session state if not set
                 idx_key = f"img_idx_{phylum}"
                 if idx_key not in st.session_state:
                     st.session_state[idx_key] = 0
-                
+             
                 current_idx = st.session_state[idx_key]
                 current_img = images[current_idx]
-                
+             
                 image_dir = "./data/phylumimgs/"
                 image_path = os.path.join(image_dir, current_img['file'])
-                
+             
                 with col:
                     if os.path.exists(image_path):
                         # Load and base64-encode the image for <img> tag
                         with open(image_path, "rb") as img_file:
                             img_data = img_file.read()
                             base64_img = base64.b64encode(img_data).decode('utf-8')
-                            img_ext = os.path.splitext(image_path)[1][1:]  # 'png' or 'jpg'
-                        
+                            img_ext = os.path.splitext(image_path)[1][1:] # 'png' or 'jpg'
+                     
                         description = current_img.get('description', '')
                         location = current_img.get('location', '')
                         author = current_img.get('author', '')
                         license = current_img.get('license', '')
                         source_link = current_img.get('source_link', '')
-                        attribution = current_img.get('attribution', '')  # Fallback full string
-                        
+                        attribution = current_img.get('attribution', '') # Fallback full string
+                     
                         # Build alt: description if available, else generic
                         alt_text = description if description else f"{phylum} Image {current_idx+1}"
-                        
+                     
                         # Build title: combine all available fields
                         title_parts = []
                         if description:
@@ -1339,10 +1639,10 @@ if not selected_phylum:
                             title_parts.append(f"License: {license}")
                         if source_link:
                             title_parts.append(f"Source: {source_link}")
-                        if attribution and not (author or license or source_link):  # Use full attribution if fields are missing
+                        if attribution and not (author or license or source_link): # Use full attribution if fields are missing
                             title_parts.append(attribution)
                         title_attr = f' title="{" | ".join(title_parts)}"' if title_parts else ''
-                        
+                     
                         # Display image with alt and hover tooltip
                         st.markdown(
                             f'<img src="data:image/{img_ext};base64,{base64_img}" alt="{alt_text}"{title_attr} style="width:100%; height:auto;">',
@@ -1350,10 +1650,10 @@ if not selected_phylum:
                         )
                     else:
                         st.warning(f"Image not found: {current_img['file']}")
-                    
+                 
                     # Vernacular below image
-                    st.write(phylum_info[phylum]['vernacular'])
-                    
+                    st.write(f"{phylum} ({phylum_info[phylum]['vernacular']})")
+                 
                     # Cycling buttons if multiple images
                     if len(images) > 1:
                         btn_cols = st.columns(2)
@@ -1365,30 +1665,30 @@ if not selected_phylum:
                             if st.button("Next", key=f"next_{phylum}_{i+j}"):
                                 st.session_state[idx_key] = (current_idx + 1) % len(images)
                                 st.rerun()
-                    
+                 
                     # Details expander (no images here; keep text-only)
                     with st.expander("Details"):
                         st.markdown(phylum_info[phylum]['description'])
-                    
+                 
                     if st.button("Select", key=f"select_{phylum}"):
                         st.session_state.selected_phylum = phylum
                         selected_phylum = phylum
-                        st.rerun()  # Rerun to update the UI immediately
+                        st.rerun() # Rerun to update the UI immediately
 else:
     st.success(f"Selected: {selected_phylum} ({phylum_info[selected_phylum]['vernacular']})")
     with st.expander("Details"):
         st.markdown(phylum_info[selected_phylum]['description'])
-        
+     
         # Display all images for selected phylum
         images = phylum_info[selected_phylum].get('images', [])
         if images:
             st.subheader("Images")
-            num_img_cols = min(3, len(images))  # Up to 3 columns for layout
+            num_img_cols = min(3, len(images)) # Up to 3 columns for layout
             if len(images) > 1:
                 img_cols = st.columns(num_img_cols)
             else:
-                img_cols = [st]  # Just use the main container if one
-            
+                img_cols = [st] # Just use the main container if one
+         
             for idx, img_data in enumerate(images):
                 image_path = os.path.join("./data/phylumimgs/", img_data['file'])
                 if os.path.exists(image_path):
@@ -1398,8 +1698,8 @@ else:
                         author = img_data.get('author', '')
                         license = img_data.get('license', '')
                         source_link = img_data.get('source_link', '')
-                        attribution = img_data.get('attribution', '')  # Fallback
-                        
+                        attribution = img_data.get('attribution', '') # Fallback
+                     
                         # Build caption: combine all available fields
                         caption_parts = []
                         if description:
@@ -1412,20 +1712,19 @@ else:
                             caption_parts.append(f"License: {license}")
                         if source_link:
                             caption_parts.append(f"Source: {source_link}")
-                        if attribution and not (author or license or source_link):  # Use full if fields missing
+                        if attribution and not (author or license or source_link): # Use full if fields missing
                             caption_parts.append(attribution)
                         else:
                             caption_parts.append("No additional details available")
                         caption = " | ".join(caption_parts)
-                        
-                        st.image(image_path, use_column_width=True, caption=caption)
+                     
+                        st.image(image_path, use_container_width=True, caption=caption)
                 else:
                     st.warning(f"Image not found: {img_data['file']}")
-    
+ 
     if st.button("Change Phylum"):
         st.session_state.selected_phylum = None
         st.rerun()
-
 if not selected_phylum:
     st.info("Select a phylum to explore evolutionary patterns.")
 else:
@@ -1452,7 +1751,7 @@ else:
     else:
         st.sidebar.write("No points clicked yet.")
     # Initialize map
-    m = folium.Map(location=[0, 0], zoom_start=2, tiles=None)
+    m = folium.Map(location=[0, 0], zoom_start=2, tiles=None, attributionControl=False)
     folium.TileLayer("OpenStreetMap", name="Base Map").add_to(m)
     gebco_wms = "https://www.gebco.net/data_and_products/gebco_web_services/web_map_service/mapserv?"
     folium.WmsTileLayer(
@@ -1462,209 +1761,38 @@ else:
         transparent=True,
         name="Seafloor Bathymetry (GEBCO)",
     ).add_to(m)
-    # Add scale (measure control)
-    MeasureControl(position='bottomleft', primary_length_unit='kilometers', secondary_length_unit=None, primary_area_unit=None, secondary_area_unit=None).add_to(m)
+    # Add GBIF density layer
+    taxon_id = phylum_info[selected_phylum]['gbif_taxon_id']
+    density_url = (
+        f"https://api.gbif.org/v2/map/occurrence/density/{{z}}/{{x}}/{{y}}@1x.png?"
+        f"source=density&taxonKey={taxon_id}&bin=hex&hexPerTile=30&style=classic.poly&srs=EPSG:3857"
+    )
+    density_layer = folium.TileLayer(
+        tiles=density_url,
+        attr='Occurrence data from GBIF | © OpenMapTiles',
+        name=f"{selected_phylum} Density (GBIF)",
+        overlay=True,
+        control=True,
+        opacity=0.7, # Semi-transparent to see base layers
+    ).add_to(m)
+    # Add custom attribution control at bottom-left
+    AttributionControl().add_to(m)
+    # Add scale (measure control) 3D user defined points, click to finish
+    # MeasureControl(position='bottomleft', primary_length_unit='kilometers', secondary_length_unit=None, primary_area_unit=None, secondary_area_unit=None).add_to(m)
+    
+    ScaleControl().add_to(m)
+    # m.get_root().header.add_child(folium.Element('<style>.leaflet-bottom .leaflet-control-scale { transform: translateY(-20px); }</style>'))
+    m.get_root().header.add_child(folium.Element('<style>.leaflet-control-attribution { background: transparent !important; }</style>'))
+
+
     # Hardcoded hotspots (replace with json load if file available)
     hotspots = {
         "Acanthocephala": [
             {"lat": 44.65, "lon": -63.57, "region": "Halifax, Canada (Lobster Habitats)"},
             {"lat": 22.63, "lon": 120.27, "region": "Kaohsiung, Taiwan (Red Snapper Habitats)"}
         ],
-        "Acoelomorpha": [
-            {"lat": 3.25, "lon": 73, "region": "Maldives, Indian Ocean"}
-        ],
-        "Annelida": [
-            {"lat": 9.83, "lon": -104.3, "region": "East Pacific Rise (Hydrothermal Vents)"},
-            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef (Coral Reefs)"},
-            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean (Coral Reefs)"},
-            {"lat": 36.8, "lon": -122.0, "region": "Monterey Bay (Tidal Zones)"},
-            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Bay (Marine Habitats)"}
-        ],
-        "Arthropoda": [
-            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef (Crustacean Diversity)"},
-            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean (Lobster Habitats)"},
-            {"lat": -34.93, "lon": 138.6, "region": "Adelaide Coast, South Australia"},
-            {"lat": 22.63, "lon": 120.27, "region": "South China Sea (Marine Arthropods)"},
-            {"lat": 49.25, "lon": -123.12, "region": "Vancouver Coast, British Columbia"},
-            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctica (Deep Sea)"},
-            {"lat": -23.65, "lon": -70.4, "region": "Antofagasta, Chile (Coastal)"}
-        ],
-        "Brachiopoda": [
-            {"lat": 43, "lon": 131, "region": "Sea of Japan"},
-            {"lat": -23.65, "lon": -70.4, "region": "Antofagasta, Northern Chile"},
-            {"lat": 12.4, "lon": 102.52, "region": "Trat Province, Thailand (Mangroves)"},
-            {"lat": -18.14, "lon": 178.44, "region": "Suva, Fiji"},
-            {"lat": 35.1, "lon": 139.08, "region": "Japan Coastal"}
-        ],
-        "Bryozoa": [
-            {"lat": 43, "lon": -69, "region": "Gulf of Maine"},
-            {"lat": 47.61, "lon": -122.33, "region": "Seattle, US Northwest Coast"},
-            {"lat": 78, "lon": 16, "region": "Svalbard, Arctic"},
-            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"},
-            {"lat": 20.6, "lon": -16.25, "region": "Banc d'Arguin, Mauritania"},
-            {"lat": 35.12, "lon": 33.43, "region": "Cyprus, Mediterranean"},
-            {"lat": 35.53, "lon": 129.03, "region": "South Africa Coastal"},
-            {"lat": 12.4, "lon": 102.52, "region": "Trat Province, Thailand"}
-        ],
-        "Chaetognatha": [
-            {"lat": 75, "lon": -150, "region": "Canada Basin, Arctic"},
-            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"},
-            {"lat": -30, "lon": -30, "region": "South Atlantic"},
-            {"lat": 35.17, "lon": 129.03, "region": "Busan, Korean Waters"},
-            {"lat": 44, "lon": 35, "region": "Black Sea"},
-            {"lat": 35, "lon": 30, "region": "Eastern Mediterranean"},
-            {"lat": 55, "lon": 3, "region": "North Sea"},
-            {"lat": 57, "lon": 20, "region": "Baltic Sea"}
-        ],
-        "Chordata": [
-            {"lat": 22.63, "lon": 120.27, "region": "South China Sea"},
-            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef (Marine Diversity)"},
-            {"lat": 30, "lon": -60, "region": "Sargasso Sea (Fish Diversity)"},
-            {"lat": -0.5, "lon": -90.5, "region": "Galápagos"},
-            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean"},
-            {"lat": 50, "lon": -30, "region": "North Atlantic"},
-            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"},
-            {"lat": -63.38, "lon": -57, "region": "Antarctic Peninsula"}
-        ],
-        "Cnidaria": [
-            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
-            {"lat": -0.5, "lon": -90.5, "region": "Galápagos (Coral/Anemone Spot)"},
-            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean (Coral Reefs)"},
-            {"lat": 3.25, "lon": 73, "region": "Maldives, Indian Ocean (Tropical Reefs)"},
-            {"lat": 9.83, "lon": -104.3, "region": "East Pacific Rise (Hydrothermal Vents)"},
-            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic (Polar Seabeds)"}
-        ],
-        "Ctenophora": [
-            {"lat": 44, "lon": 35, "region": "Black Sea"},
-            {"lat": 46, "lon": 35, "region": "Sea of Azov"},
-            {"lat": 35, "lon": 30, "region": "Eastern Mediterranean"},
-            {"lat": 55, "lon": 3, "region": "North Sea"},
-            {"lat": 57, "lon": 20, "region": "Baltic Sea"},
-            {"lat": 78, "lon": 16, "region": "Svalbard, Arctic"},
-            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic"}
-        ],
-        "Cycliophora": [
-            {"lat": 50, "lon": -30, "lon": "North Atlantic"},
-            {"lat": 40, "lon": 15, "region": "Mediterranean"}
-        ],
-        "Echinodermata": [
-            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
-            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean"},
-            {"lat": -75, "lon": -175, "region": "Ross Sea, Antarctic (Deep Sea)"},
-            {"lat": 28.03, "lon": -111.77, "region": "Gulf of California"},
-            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Bay"}
-        ],
-        "Entoprocta": [
-            {"lat": -63.38, "lon": -57, "region": "Antarctic Peninsula"},
-            {"lat": 65.5, "lon": 38, "region": "White Sea"}
-        ],
-        "Gastrotricha": [
-            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"},
-            {"lat": 42.12, "lon": 15.5, "region": "Tremiti Archipelago, Adriatic"}
-        ],
-        "Gnathostomulida": [
-            {"lat": 58.94, "lon": 20.13, "region": "Baltic Sea (Interstitial Jaw Worm Habitats)"},
-            {"lat": 15.33, "lon": -76.16, "region": "Caribbean Sea (Shallow Coastal Gnathostomulid Spot)"}
-        ],
-        "Hemichordata": [
-            {"lat": 50.37, "lon": -4.14, "region": "Plymouth, England"},
-            {"lat": 32.3, "lon": -64.79, "region": "Bermuda"}
-        ],
-        "Kinorhyncha": [
-            {"lat": 7.34, "lon": -128.69, "region": "Clarion-Clipperton Fracture Zone (Abyssal Mud Dragon Habitats)"},
-            {"lat": 11.2, "lon": 95.66, "region": "Andaman Sea (Intertidal Kinorhynch Diversity)"}
-        ],
-        "Loricifera": [
-            {"lat": 35.18, "lon": 21.41, "region": "L'Atalante Basin, Mediterranean"},
-            {"lat": 30, "lon": -28.5, "region": "Great Meteor Seamount, Atlantic"},
-            {"lat": 48.72, "lon": -3.99, "region": "Roscoff, France"},
-            {"lat": 61.89, "lon": -6.91, "region": "Faroe Bank, North Atlantic"}
-        ],
-        "Mollusca": [
-            {"lat": 28.03, "lon": -111.77, "region": "Gulf of California"},
-            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
-            {"lat": -34.93, "lon": 138.6, "region": "Adelaide, South Australia"},
-            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Bay"},
-            {"lat": 21.31, "lon": -157.86, "region": "Honolulu, Hawaii (Pacific)"},
-            {"lat": 49.25, "lon": -123.12, "region": "Vancouver Coast"}
-        ],
-        "Nematoda": [
-            {"lat": 55, "lon": 3, "region": "North Sea (Ocean Floor)"},
-            {"lat": 57, "lon": 20, "region": "Baltic Sea"},
-            {"lat": 44, "lon": 35, "region": "Black Sea"}
-        ],
-        "Nematomorpha": [
-            {"lat": 34.55, "lon": 18.05, "region": "Mediterranean Sea (Marine Horsehair Worm Habitats)"},
-            {"lat": 31.78, "lon": -40.25, "region": "North Atlantic Ocean (Pelagic Nematomorpha Spot)"}
-        ],
-        "Nemertea": [
-            {"lat": 37.77, "lon": -122.43, "region": "San Francisco Coastal"},
-            {"lat": 21.31, "lon": -157.86, "region": "Honolulu, Hawaii"},
-            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"},
-            {"lat": 55, "lon": 3, "region": "North Sea"},
-            {"lat": 28.03, "lon": -111.77, "region": "Gulf of California"}
-        ],
-        "Orthonectida": [
-            {"lat": 65.65, "lon": 36.85, "region": "White Sea (Parasitic Orthonectid Habitats)"},
-            {"lat": 47.6, "lon": -122.45, "region": "Puget Sound (Invertebrate Host Diversity)"}
-        ],
-        "Phoronida": [
-            {"lat": 65.5, "lon": 38, "region": "White Sea, Arctic"},
-            {"lat": -23.65, "lon": -70.4, "region": "California Coastal"},
-            {"lat": 43, "lon": 131, "region": "Sea of Japan"},
-            {"lat": 22.63, "lon": 120.27, "region": "South China Sea"},
-            {"lat": 21.31, "lon": -157.86, "region": "Hawaii"}
-        ],
-        "Placozoa": [
-            {"lat": 35.1, "lon": 139.08, "region": "Seto Inland Sea, Japan"},
-            {"lat": 22.36, "lon": 114.11, "region": "Hong Kong"},
-            {"lat": 40.64, "lon": 14.38, "region": "Naples, Italy"},
-            {"lat": 35.18, "lon": 21.41, "region": "Mediterranean"}
-        ],
-        "Platyhelminthes": [
-            {"lat": 14, "lon": 120.97, "region": "Philippines"},
-            {"lat": 3.25, "lon": 73, "region": "Maldives"},
-            {"lat": -36.85, "lon": 174.76, "region": "New Zealand"},
-            {"lat": 13.5, "lon": 144.8, "region": "Guam"},
-            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"}
-        ],
-        "Porifera": [
-            {"lat": 36.8, "lon": -122.0, "region": "Monterey Bay (Sponge Habitats)"},
-            {"lat": -16.5, "lon": 145.5, "region": "Great Barrier Reef"},
-            {"lat": 25.03, "lon": -78.04, "region": "Bahamas, Caribbean"},
-            {"lat": 37.77, "lon": -122.43, "region": "California Deep Waters"},
-            {"lat": 35.18, "lon": 21.41, "region": "Mediterranean Caves"},
-            {"lat": -75, "lon": -175, "region": "Antarctic Regions"},
-            {"lat": 28.03, "lon": -111.77, "region": "Deep Pacific"},
-            {"lat": 29.53, "lon": 35.01, "region": "Northern Red Sea"}
-        ],
-        "Priapulida": [
-            {"lat": 60, "lon": -150, "region": "Alaskan Bay"},
-            {"lat": -75, "lon": -175, "region": "Antarctic"},
-            {"lat": -18.14, "lon": 178.44, "region": "Fiji"}
-        ],
-        "Rhombozoa": [
-            {"lat": 35.1, "lon": 139.08, "region": "Japan (Temperate Benthic)"}
-        ],
-        "Rotifera": [
-            {"lat": 44.0, "lon": -124.1, "region": "Oregon Coast (Marine Rotifer Habitats)"},
-            {"lat": -18.16, "lon": 147.49, "region": "Great Barrier Reef (Planktonic Rotifer Diversity)"}
-        ],
-        "Sipuncula": [
-            {"lat": 21.31, "lon": -157.86, "region": "Hawaii"},
-            {"lat": -33.92, "lon": 18.42, "region": "Cape Town, South Africa"},
-            {"lat": 37.77, "lon": -122.43, "region": "San Francisco"}
-        ],
-        "Tardigrada": [
-            {"lat": -75, "lon": -175, "region": "Antarctic"},
-            {"lat": 3.25, "lon": 73, "region": "Tropical Rainforests (Marine)"}
-        ],
-        "Xenoturbellida": [
-            {"lat": 58.33, "lon": 11.55, "region": "Gullmarsfjorden, Swedish West Coast"},
-            {"lat": 35.1, "lon": 139.08, "region": "Western Pacific, Japan"}
-        ]
     }
-    phylum_points = hotspots.get(selected_phylum, [])
+    phylum_points = phylum_info[selected_phylum]['hotspots']
     hotspot_layer = folium.FeatureGroup(name=f"{selected_phylum} Hotspots").add_to(m)
     for point in phylum_points:
         folium.Marker(
@@ -1689,6 +1817,7 @@ else:
             ).add_to(hotspot_layer)
         if len(phylum_points) == 0:
             st.info("No specific hotspots for this phylum; showing generic marine hotspots as fallback. Click near them for data.")
+    
     @st.cache_data
     def load_shapefile(reef_path):
         reefs = gpd.read_file(reef_path)
@@ -1742,25 +1871,48 @@ else:
                 st.warning(f"Error loading {selected_shp}: {e}.")
         else:
             st.warning("No shapefiles found in 'data/14_001_WCMC008_CoralReefs2018_v4_1/01_Data'.")
+    
     @st.cache_data
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-    def fetch_obis_data(geom, size=100, phylum=None):
+    def fetch_obis_data(geom, size=500, phylum=None):
         occ_list = []
         taxa = []
+        fallback_used = False  # New: Flag to track if GBIF fallback was used
         try:
-            print(f"INFO: Fetching OBIS data for geometry: {geom} with size={size} phylum={phylum}")
-            query = occurrences.search(geometry=geom, size=size, phylum=phylum)
+            print(f"Fetching OBIS data for geometry: {geom} with size={size} scientificname={phylum}")
+            query = occurrences.search(geometry=geom, size=size, scientificname=phylum)
             occ_data = query.execute()
             if isinstance(occ_data, pd.DataFrame):
                 results = occ_data.to_dict('records')
             else:
                 results = occ_data.get('results', [])
-            print(f"INFO: Raw OBIS results: {results[:2]}") # Debug: Log first records
-     
+            print(f'\n\n\nstart test\n\n\n')
+            print(f'occ_data\n\n{occ_data}\n\n')
+            print(f"Raw OBIS results count: {len(results)}")
+            print(f"Total from API: {occ_data.get('total', 0)}") # Check overall matching count
+            print(f"First two results: {results[:2]}")
+            # Check phyla
+            phyla = set(rec.get('phylum') for rec in results if rec.get('phylum'))
+            print(f"Unique phyla in results: {phyla}")
+            if phyla and all(p.lower() == phylum.lower() for p in phyla):
+                print("Success: All results restricted to the phylum!")
+            else:
+                print("Issue: Outer phyla or mismatches detected.")
+           
+            # Optional: Print sample records for inspection
+            for rec in results[:3]:
+                print(f"Sample: scientificName={rec.get('scientificName')}, phylum={rec.get('phylum')}")
+           
+           
+           
+            print(f'stop test\n\n\n')
             # Extract all scientific names
             for rec in results:
                 if rec: # Skip empty
+                    rec_phylum = rec.get('phylum')
+                    print(f"Record phylum: {rec_phylum}")
                     sci_name = rec.get('scientificName', 'Unknown')
+                    print(f"Adding sci_name: {sci_name}")
                     if sci_name and sci_name != 'Unknown' and isinstance(sci_name, str):
                         taxa.append(sci_name.strip())
              
@@ -1770,15 +1922,54 @@ else:
                     if lat is not None and lon is not None and isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
                         occ_list.append({'lat': lat, 'lon': lon, 'name': sci_name})
             taxa = list(set(taxa)) # Dedupe and clean
+            
+            # New: GBIF fallback if OBIS taxa < 5
+            if len(taxa) < 50:
+                fallback_used = True  # Set flag
+                print("\n\nFalling back to GBIF due to sparse OBIS data")
+                gbif_data = {}
+                phylum_key = phylum_info[phylum]['gbif_taxon_id']
+                params = {'limit': 500, 'offset': 0}
+                if phylum_key:
+                    params['phylumKey'] = phylum_key
+                else:
+                    print("Skipping phylum filter due to key fetch failure")
+                
+                geom_encoded = urllib.parse.quote(geom)
+                query_str = urllib.parse.urlencode(params) + "&geometry=" + geom_encoded
+                full_url = base_url + "?" + query_str
+                try:
+                    print(f'\n\nfull_url:{full_url}\n\n')
+                    response = requests.get(full_url)
+                    response.raise_for_status()
+                    gbif_data = response.json()
+                except Exception as e:
+                    print(f"GBIF API error: {e}")
+                gbif_results = gbif_data.get('results', [])
+                # Parse similar to OBIS
+                for rec in gbif_results:
+                    sci_name = rec.get('scientificName', 'Unknown')
+                    if sci_name and sci_name != 'Unknown':
+                        taxa.append(sci_name.strip())
+                    lat = rec.get('decimalLatitude')
+                    lon = rec.get('decimalLongitude')
+                    if lat is not None and lon is not None:
+                        occ_list.append({'lat': lat, 'lon': lon, 'name': sci_name})
+                taxa = list(set(taxa))  # Dedupe after merge
+            
+                        
             if not taxa:
-                print("INFO: No taxa found.")
-                return {'species': [], 'occurrences': []}
-            print(f"INFO: Resolved to {len(taxa)} taxa names: {taxa[:5]}...") # Debug
-            return {'species': taxa, 'occurrences': occ_list}
+                print("No taxa found.")
+                return {'species': [], 'occurrences': [], 'fallback_used': fallback_used}  # Updated return
+            
+            print(f"Resolved to {len(taxa)} taxa names: {taxa[:5]}...")
+            return {'species': taxa, 'occurrences': occ_list, 'fallback_used': fallback_used}  # Updated return
         except Exception as e:
-            print(f"ERROR: OBIS API error: {e}")
-            return {'species': [], 'occurrences': []}
-     
+            print(f"OBIS API error: {e}")
+            return {'species': [], 'occurrences': [], 'fallback_used': fallback_used}  # Updated return
+      
+
+
     def geocode(location):
         url = f"https://nominatim.openstreetmap.org/search?q={location}&format=json"
         headers = {'User-Agent': 'StreamlitOceanExplorer/1.0'}
@@ -1793,7 +1984,7 @@ else:
     def fetch_sequence(taxon):
         """Fetch a single COI sequence for a given taxon from NCBI."""
         term = f"{taxon}[Organism] AND COI[Gene Name] AND (\"500\"[SLEN] : \"2000\"[SLEN])"
-        print(f"INFO: Searching NCBI for: {term}")
+        print(f"Searching NCBI for: {term}")
         try:
             search_handle = Entrez.esearch(db="nucleotide", term=term, retmax=1, idtype="acc")
             search_results = Entrez.read(search_handle)
@@ -1803,10 +1994,12 @@ else:
                 fetch_handle = Entrez.efetch(db="nucleotide", id=id_list[0], rettype="fasta", retmode="text")
                 record = SeqIO.read(fetch_handle, "fasta")
                 fetch_handle.close()
+                print(f"Fetched sequence for {taxon}: {record.id}")
                 return record
+            print(f"No sequence found for {taxon}")
             return None
         except Exception as e:
-            print(f"WARNING: Failed to fetch sequence for {taxon}: {e}")
+            print(f"Failed to fetch sequence for {taxon}: {e}")
             return None
     def is_species_level(taxon):
         """Check if taxon is at species level."""
@@ -1827,10 +2020,10 @@ else:
             result = subprocess.run(["mafft", "--version"], capture_output=True, text=True, check=False)
             if result.returncode != 0:
                 raise FileNotFoundError("MAFFT is not installed or not found in PATH.")
-       
+    
             temp_fasta = "temp.fasta"
             aligned_fasta = "aligned.fasta"
-       
+    
             # Temporarily shorten IDs to avoid MAFFT truncation issues (>250 chars)
             original_ids = [rec.id for rec in sequences] # Save originals
             for i, rec in enumerate(sequences):
@@ -1838,40 +2031,41 @@ else:
                 rec.id = short_id
                 rec.name = short_id
                 rec.description = short_id
-       
+    
             with open(temp_fasta, "w") as f:
                 SeqIO.write(sequences, f, "fasta")
-       
+    
             subprocess.run(["mafft", "--auto", "--quiet", temp_fasta], stdout=open(aligned_fasta, "w"), check=True, text=True)
-       
+    
             if not os.path.exists(aligned_fasta) or os.path.getsize(aligned_fasta) == 0:
                 raise RuntimeError("MAFFT produced no output or an empty file.")
-       
+    
             aligned = list(SeqIO.parse(aligned_fasta, "fasta"))
-       
+    
             # Remap original IDs (order preserved)
             for i, rec in enumerate(aligned):
                 rec.id = original_ids[i]
                 rec.name = original_ids[i]
                 rec.description = original_ids[i]
-       
+    
             for file in [temp_fasta, aligned_fasta]:
                 if os.path.exists(file):
                     os.remove(file)
-       
+    
             if not aligned:
                 raise ValueError("No sequences found in MAFFT output.")
-       
+    
+            print("Alignment successful with MAFFT")
             return aligned
         except FileNotFoundError:
             st.warning("MAFFT is not installed. Falling back to progressive pairwise alignment.")
-            print("ERROR: MAFFT not found. Attempting pairwise alignment.")
+            print("MAFFT not found. Attempting pairwise alignment.")
             try:
                 aligner = PairwiseAligner()
                 if len(sequences) < 2:
                     st.error("Insufficient sequences for alignment.")
                     return sequences
-           
+        
                 # Progressive pairwise for >2 sequences (simple chain)
                 aligned_seqs = [sequences[0]]
                 for seq in sequences[1:]:
@@ -1880,14 +2074,15 @@ else:
                     aligned_seqs[-1].seq = alignments[0][0] # Update previous
                     seq.seq = alignments[0][1] # Update current
                     aligned_seqs.append(seq)
-           
+        
+                print("Pairwise alignment successful")
                 return aligned_seqs
             except Exception as e:
                 st.error(f"Pairwise alignment failed: {e}. Returning unaligned sequences.")
                 return sequences
         except Exception as e:
             st.warning(f"MAFFT alignment failed: {e}. Returning unaligned sequences.")
-            print(f"ERROR: MAFFT alignment error: {e}")
+            print(f"MAFFT alignment error: {e}")
             for file in [temp_fasta, aligned_fasta]:
                 if os.path.exists(file):
                     os.remove(file)
@@ -1925,7 +2120,7 @@ else:
         # Create inverse map for taxon lookup
         label_to_sci = {v: k for k, v in sci_to_label.items()}
         # Add image axes
-        ax_images = fig.add_axes([0.75, 0.05, 0.2, 0.9], frameon=False)
+        ax_images = fig.add_axes([0.72, 0.05, 0.2, 0.9], frameon=False)
         ax_images.set_xlim(-0.1, 1)
         ax_images.set_ylim(ax_tree.get_ylim())
         ax_images.set_xticks([])
@@ -1934,12 +2129,17 @@ else:
         for label, y in leaf_y.items():
             taxon = label_to_sci.get(label)
             if taxon:
-                img_url = get_species_image(taxon)
-                if img_url:
+                img_path = get_species_image(taxon)
+                if img_path:
                     try:
-                        response = requests.get(img_url, timeout=5)
-                        img = Image.open(io.BytesIO(response.content))
-                        imagebox = OffsetImage(img, zoom=0.05) # Adjust zoom for size
+                        img = Image.open(img_path)
+                        # Resize to fixed height for uniform size
+                        target_height = 30 # pixels
+                        width, height = img.size
+                        scale = target_height / height
+                        new_size = (int(width * scale), target_height)
+                        img = img.resize(new_size, Image.LANCZOS)
+                        imagebox = OffsetImage(img, zoom=1)
                         ab = AnnotationBbox(imagebox, (0, y), xycoords='data', boxcoords="data", pad=0, frameon=False, box_alignment=(0, 0.5))
                         ax_images.add_artist(ab)
                     except Exception as e:
@@ -1948,7 +2148,8 @@ else:
         plt.savefig(img_buffer, format="png", dpi=300)
         img_buffer.seek(0)
         plt.close(fig)
-        return Image.open(img_buffer)
+        return Image.open(img_buffer), leaf_y, label_to_sci
+
     def circle_to_polygon(lon, lat, radius_km=100, num_points=32):
         points = []
         earth_radius = 6371
@@ -1957,9 +2158,11 @@ else:
             dlat = (radius_km / earth_radius) * (180 / math.pi) * math.cos(angle)
             dlon = (radius_km / earth_radius) * (180 / math.pi) / math.cos(lat * math.pi / 180) * math.sin(angle)
             points.append((lon + dlon, lat + dlat))
+        points = points[::-1]  # Reverse for counter-clockwise winding
         points.append(points[0])
         wkt = "POLYGON((" + ", ".join(f"{x:.6f} {y:.6f}" for x, y in points) + "))"
         return wkt
+
     @lru_cache(maxsize=1000)
     def fetch_colloquial_name(taxon):
         """
@@ -2006,7 +2209,7 @@ else:
                             if v.get('language') == 'eng' and v.get('vernacularName'):
                                 return v['vernacularName'].split(',')[0].strip() + ' (phylum-level)', 'GBIF'
         except Exception as e:
-            print(f"WARNING: GBIF error for {taxon}: {e}")
+            print(f"GBIF error for {taxon}: {e}")
         # 3. ITIS API: Fixed endpoints and parsing
         try:
             search_url = f"https://www.itis.gov/ITISWebService/jsonservice/searchByScientificName?srchKey={taxon.replace(' ', '%20')}"
@@ -2024,7 +2227,7 @@ else:
                                 return cn['commonName'].strip(), 'ITIS'
                         return common_names[0].get('commonName', 'Unknown'), 'ITIS' # Fallback
         except Exception as e:
-            print(f"WARNING: ITIS error for {taxon}: {e}")
+            print(f"ITIS error for {taxon}: {e}")
         # 4. NCBI fallback: Quick lit search for common name in abstracts
         try:
             term = f"{taxon}[organism] AND (common name OR english name OR vernacular)"
@@ -2040,7 +2243,7 @@ else:
                 if match:
                     return match.group(1).strip(), 'NCBI Literature'
         except Exception as e:
-            print(f"WARNING: NCBI error for {taxon}: {e}")
+            print(f"NCBI error for {taxon}: {e}")
         # 5. DuckDuckGo fallback: Instant answer API for quick web search
         try:
             ddg_url = f"https://api.duckduckgo.com/?q=common+name+of+{taxon.replace(' ', '+')}&format=json&pretty=1"
@@ -2058,9 +2261,9 @@ else:
                     if match:
                         return match.group(1).strip(), 'DuckDuckGo'
         except Exception as e:
-            print(f"WARNING: DuckDuckGo error for {taxon}: {e}")
+            print(f"DuckDuckGo error for {taxon}: {e}")
         return 'Unknown', 'N/A'
-     
+  
     @lru_cache(maxsize=100) # Cache to avoid redundant OBIS calls
     def resolve_to_species(taxon_list, center_lat, center_lon, max_per_taxon=1):
         """
@@ -2081,22 +2284,22 @@ else:
             if len(taxon.split()) >= 2 and is_species_level(taxon):
                 resolved.append(taxon)
                 continue
-     
+  
             try:
                 # Get AphiaID
                 cl_data = checklist.list(scientificname=taxon).execute()
                 results = cl_data.get('results', [])
                 if not results or not isinstance(results, list):
-                    print(f"WARNING: No valid results for {taxon} in checklist")
+                    print(f"No valid results for {taxon} in checklist")
                     continue
                 if not results[0]:
-                    print(f"WARNING: results[0] is None or falsy for {taxon}")
+                    print(f"results[0] is None or falsy for {taxon}")
                     continue
                 aphiaid = results[0].get('aphiaID')
                 if not aphiaid:
-                    print(f"WARNING: No AphiaID for {taxon}")
+                    print(f"No AphiaID for {taxon}")
                     continue
-         
+      
                 # Get child species via OBIS API
                 child_url = f"https://api.obis.org/v3/taxon/{aphiaid}/children?rank=Species"
                 response = requests.get(child_url)
@@ -2104,14 +2307,14 @@ else:
                 child_data = response.json()
                 child_results = child_data.get('results', [])
                 if not child_results or not isinstance(child_results, list):
-                    print(f"WARNING: No valid child results for {taxon}")
+                    print(f"No valid child results for {taxon}")
                     continue
                 child_species = [rec['scientificName'] for rec in child_results if rec.get('taxonRank') == 'Species']
-         
+      
                 if not child_species:
-                    print(f"WARNING: No child species for {taxon}")
+                    print(f"No child species for {taxon}")
                     continue
-         
+      
                 # Filter by proximity (bounding box: ±5° around center)
                 bbox = f"POLYGON(({center_lon-5} {center_lat-5},{center_lon-5} {center_lat+5},{center_lon+5} {center_lat+5},{center_lon+5} {center_lat-5},{center_lon-5} {center_lat-5}))"
                 geo_filtered = []
@@ -2121,22 +2324,23 @@ else:
                         geo_filtered.append(sp)
                         if len(geo_filtered) >= max_per_taxon:
                             break
-         
+      
                 # If no geo-match, pick first species as fallback
                 to_add = geo_filtered if geo_filtered else child_species[:max_per_taxon]
                 resolved.extend(to_add)
-                print(f"INFO: Resolved {taxon} to: {to_add}")
+                print(f"Resolved {taxon} to: {to_add}")
             except Exception as e:
-                print(f"WARNING: Resolution failed for {taxon}: {e}")
+                print(f"Resolution failed for {taxon}: {e}")
         resolved = list(set(resolved)) # Dedupe final list
         if not resolved:
-            print("INFO: No species resolved; returning original list")
+            print("No species resolved; returning original list")
             return [t for t in taxon_list if isinstance(t, str) and len(t.split()) >= 2] # Keep only species-like
         return resolved
     def get_species_image(taxon):
-        """Fetch a thumbnail image URL for the species from WoRMS or Wikimedia Commons."""
+        """Fetch a thumbnail image URL for the species from WoRMS or Wikimedia Commons, save locally."""
         colloquial, _ = fetch_colloquial_name(taxon)
         search_term = colloquial if colloquial != 'Unknown' else taxon
+        img_url = None
         # Prioritize WoRMS
         try:
             resp = pyworms.aphiaRecordsByName(taxon, marine_only=False)
@@ -2153,24 +2357,44 @@ else:
                             img_src = match.group(1)
                             if not img_src.startswith('http'):
                                 img_src = 'https://www.marinespecies.org' + img_src
-                            return img_src
+                            img_url = img_src
         except Exception as e:
-            print(f"WARNING: Failed to fetch WoRMS image for {taxon}: {e}")
+            print(f"Failed to fetch WoRMS image for {taxon}: {e}")
         # Fallback to Wikimedia Commons search
-        try:
-            search_url = f"https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(search_term)}&srnamespace=6&format=json&srlimit=1"
-            resp = requests.get(search_url).json()
-            search_results = resp['query']['search']
-            if search_results:
-                title = requests.utils.quote(search_results[0]['title'])
-                image_url = f"https://commons.wikimedia.org/w/api.php?action=query&titles={title}&prop=imageinfo&iiprop=url&iiurlwidth=200&format=json"
-                img_resp = requests.get(image_url).json()
-                pages = img_resp['query']['pages']
-                for page in pages.values():
-                    if 'imageinfo' in page:
-                        return page['imageinfo'][0]['thumburl']
-        except Exception as e:
-            print(f"WARNING: Failed to fetch Wikimedia Commons image for {search_term}: {e}")
+        if not img_url:
+            try:
+                search_url = f"https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(search_term)}&srnamespace=6&format=json&srlimit=1"
+                resp = requests.get(search_url).json()
+                search_results = resp['query']['search']
+                if search_results:
+                    title = requests.utils.quote(search_results[0]['title'])
+                    image_url = f"https://commons.wikimedia.org/w/api.php?action=query&titles={title}&prop=imageinfo&iiprop=url&iiurlwidth=200&format=json"
+                    img_resp = requests.get(image_url).json()
+                    pages = img_resp['query']['pages']
+                    for page in pages.values():
+                        if 'imageinfo' in page:
+                            img_url = page['imageinfo'][0]['thumburl']
+            except Exception as e:
+                print(f"Failed to fetch Wikimedia Commons image for {search_term}: {e}")
+        if img_url:
+            # Determine extension
+            ext = img_url.split('.')[-1].split('?')[0]
+            if len(ext) > 4: # Invalid ext
+                ext = 'jpg'
+            filename = taxon.replace(' ', '_') + '.' + ext
+            img_dir = './data/imgdownloads'
+            os.makedirs(img_dir, exist_ok=True)
+            filepath = os.path.join(img_dir, filename)
+            if not os.path.exists(filepath):
+                try:
+                    response = requests.get(img_url, timeout=5)
+                    if response.ok:
+                        with open(filepath, 'wb') as f:
+                            f.write(response.content)
+                except Exception as e:
+                    print(f"Failed to download image for {taxon}: {e}")
+                    return None
+            return filepath
         return None
     def build_phylogenetic_tree(species_list, num_sequences, region, center_lat=None, center_lon=None):
         """
@@ -2196,7 +2420,7 @@ else:
                     species_list = [s for s in species_list if s != 'Unknown']
                 else:
                     st.info(f"Resolved to {len(species_list)} species-level taxa for {region}.")
-                    print(f"INFO: Resolved species: {species_list[:5]}...")
+                    print(f"Resolved species: {species_list[:5]}...")
         valid_species = [s for s in species_list if s != 'Unknown' and is_species_level(s)]
         if not valid_species:
             valid_species = [s for s in species_list if s != 'Unknown']
@@ -2225,7 +2449,7 @@ else:
                     break
                 progress_bar.progress(min((i + 1) / (target_sequences * 10), 1.0))
             except Exception as seq_e:
-                print(f"WARNING: Failed to fetch sequence for {taxon}: {seq_e}")
+                print(f"Failed to fetch sequence for {taxon}: {seq_e}")
                 failed_taxa.append(taxon)
         progress_bar.empty()
         if failed_taxa and len(sequences) < target_sequences:
@@ -2240,14 +2464,14 @@ else:
             with st.spinner("Aligning sequences and building tree..."):
                 aligned_sequences = align_sequences(sequences)
                 aln = MultipleSeqAlignment(aligned_sequences)
-           
+        
                 # Debug: Check for duplicates before distance calc
                 names = [s.id for s in aln]
                 unique_names = set(names)
                 if len(names) != len(unique_names):
                     st.error(f"Duplicates detected after alignment for {region}: {[n for n in unique_names if names.count(n) > 1]}")
                     raise ValueError("Duplicate names found after alignment")
-           
+        
                 calculator = DistanceCalculator('identity')
                 dm = calculator.get_distance(aln)
                 constructor = DistanceTreeConstructor()
@@ -2259,6 +2483,7 @@ else:
                 pd_score = sum(e.length for e in dtree.edges() if e.length is not None)
                 pd_score = 0.0 if math.isnan(pd_score) or pd_score is None else pd_score # Handle NaN
                 divergence_insight = f"Tree built from COI sequences of {', '.join([s.name for s in sequences])}"
+                print(f"Built tree with PD score: {pd_score}")
                 return newick, pd_score, divergence_insight, used_taxa
         except Exception as e:
             st.warning(f"Tree construction failed for {region}: {e}.")
@@ -2320,10 +2545,21 @@ else:
                 st.warning(f"Error loading global-stats.xlsx: {e}. Download from https://habitats.oceanplus.org/")
         else:
             st.warning("Global stats file not found. Download from https://habitats.oceanplus.org/")
+    
     folium.LayerControl().add_to(m)
     # Interactive map
     st.subheader("Interactive Map (Click near blue markers to fetch data)")
-    radius_km = st.slider("Search Radius (km)", min_value=50, max_value=500, value=100, step=50)
+    rarity = phylum_info[selected_phylum]['rarity']
+    if rarity == 'Common':
+        radius_km = 100
+        expand_steps = [200, 500] # Smaller expansions
+    elif rarity == 'Medium':
+        radius_km = 500
+        expand_steps = [800, 1200]
+    else: # Rare
+        radius_km = 1000
+        expand_steps = [1300, 2000]
+    st.info(f"Phylum: {selected_phylum} ({rarity}). Search radius: {radius_km}km")
     map_output = st_folium(m, width=700, height=500, returned_objects=["last_clicked"], key=f"main_map_{st.session_state.click_counter}")
     # Handle map clicks
     if map_output and map_output.get("last_clicked"):
@@ -2331,48 +2567,54 @@ else:
         clicked_lat = map_output["last_clicked"]["lat"]
         clicked_lon = map_output["last_clicked"]["lng"]
         st.write(f"Clicked location: Lat {clicked_lat:.2f}, Lon {clicked_lon:.2f}")
-        print(f"INFO: Map click detected: Lat {clicked_lat}, Lon {clicked_lon}")
+        print(f"Map click detected: Lat {clicked_lat}, Lon {clicked_lon}")
         geom = circle_to_polygon(clicked_lon, clicked_lat, radius_km=radius_km)
         st.write(f"Searching within a {radius_km}km radius polygon")
         poly_gdf = gpd.GeoDataFrame(
             {"name": ["Search Area"]},
             geometry=[loads(geom)],
             crs="EPSG:4326"
-        )
+            )
         click_layer = folium.FeatureGroup(name="Clicked Area", show=True).add_to(m)
         folium.GeoJson(
             poly_gdf,
             name="Search Polygon",
             style_function=lambda x: {"color": "red", "weight": 2, "fillOpacity": 0.2},
             tooltip=f"Search Area (~{radius_km}km radius)"
-        ).add_to(click_layer)
+            ).add_to(click_layer)
         # Zoom to the clicked area
         bounds = poly_gdf.total_bounds
         m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
         with st.spinner("Fetching OBIS data..."):
-            obis_data = fetch_obis_data(geom, size=100, phylum=selected_phylum)
+            obis_data = fetch_obis_data(geom, size=500, phylum=selected_phylum)
+            if obis_data.get('fallback_used'):
+                st.info("Sparse OBIS data; including GBIF results for better coverage.")
             species_list = obis_data['species']
             occ_list = obis_data['occurrences']
             # Dynamic radius expansion if sparse
-            if len(species_list) < 5:
-                st.info("Sparse data at initial radius; auto-expanding to 200km.")
-                expanded_radius = 200
-                geom = circle_to_polygon(clicked_lon, clicked_lat, radius_km=expanded_radius)
-                obis_data = fetch_obis_data(geom, size=100, phylum=selected_phylum)
+            expanded_radii = expand_steps
+            for exp_radius in expanded_radii:
+                if len(species_list) >= 5:
+                    break
+                new_radius = exp_radius  # Set to absolute value from steps
+                st.info(f"Sparse data at {radius_km}km; auto-expanding to {new_radius}km.")
+                geom = circle_to_polygon(clicked_lon, clicked_lat, radius_km=new_radius)
+                obis_data = fetch_obis_data(geom, size=500, phylum=selected_phylum)
                 species_list = obis_data['species']
                 occ_list = obis_data['occurrences']
-                # Update polygon
                 poly_gdf = gpd.GeoDataFrame(
                     {"name": ["Expanded Search Area"]},
                     geometry=[loads(geom)],
                     crs="EPSG:4326"
-                )
+                    )
                 folium.GeoJson(
                     poly_gdf,
                     name="Expanded Search Polygon",
                     style_function=lambda x: {"color": "purple", "weight": 2, "fillOpacity": 0.1},
-                    tooltip=f"Expanded Search Area (~{expanded_radius}km radius)"
-                ).add_to(click_layer)
+                    tooltip=f"Expanded Search Area (~{new_radius}km radius)"
+                    ).add_to(click_layer)
+                radius_km = new_radius # Update for display
+            pd_score = 0.0
             if species_list:
                 with st.expander("Species at Clicked Location"):
                     species_data = []
@@ -2382,13 +2624,20 @@ else:
                         species_data.append({"Scientific Name": s, "Common Name": colloquial, "Common Name Source": source, "Resolution Status": status})
                     st.write(f"Found {len(species_list)} species")
                     st.dataframe(pd.DataFrame(species_data))
-                num_sequences = st.slider(
-                    "Number of sequences to fetch for tree (COI)",
-                    min_value=1,
-                    max_value=min(100, len(species_list)),
-                    value=min(10, len(species_list)),
-                    key=f"num_sequences_{st.session_state.click_counter}"
-                )
+    
+                if len(species_list) <= 1:
+                    num_sequences = 1 if len(species_list) == 1 else 0
+                    st.info(f"Only {len(species_list)} species available. Setting number of sequences to {num_sequences}.")
+                else:
+                    num_sequences = st.slider(
+                        "Number of sequences to fetch for tree (COI)",
+                        min_value=1,
+                        max_value=min(100, len(species_list)),
+                        value=min(10, len(species_list)),
+                        key=f"num_sequences_{st.session_state.click_counter}"
+                    )
+        
+
                 label_type = st.selectbox(
                     "Tree Node Labels",
                     ["Scientific Name", "Common Name", "NCBI Accession"],
@@ -2439,11 +2688,22 @@ else:
                     # Update insight with new labels
                     divergence_insight = f"Tree built from COI sequences of {', '.join([term.name for term in tree.get_terminals()])}"
                     label_to_sci = {v: k for k, v in sci_to_label.items()}
-                    tree_img = render_tree_with_images(newick, "Phylogenetic Tree at Clicked Location", sci_to_label)
+                    tree_img, leaf_y, label_to_sci = render_tree_with_images(newick, "Phylogenetic Tree at Clicked Location", sci_to_label)
                     st.write(f"Phylogenetic Diversity: {pd_score:.1f}")
                     st.write(divergence_insight)
                     if tree_img:
                         st.image(tree_img)
+                        # Display larger images below
+                        st.subheader("Larger Species Images (Click browser zoom or right-click to enlarge)")
+                        num_img_cols = 3
+                        img_cols = st.columns(num_img_cols)
+                        for i, (label, y) in enumerate(leaf_y.items()):
+                            taxon = label_to_sci.get(label)
+                            if taxon:
+                                img_path = get_species_image(taxon)
+                                if img_path:
+                                    with img_cols[i % num_img_cols]:
+                                        st.image(img_path, caption=label, width=200)
                 clicked_cluster = MarkerCluster(name="Clicked Occurrences").add_to(click_layer)
                 for occ in occ_list:
                     folium.Marker(
@@ -2482,6 +2742,8 @@ else:
                     lat, lon = coord
                     geom = circle_to_polygon(lon, lat, radius_km=100)
                     obis_data = fetch_obis_data(geom, size=100, phylum=selected_phylum)
+                    if obis_data.get('fallback_used'):
+                        st.info("Sparse OBIS data; including GBIF results for better coverage.")
                     species_list = obis_data['species']
                 else:
                     st.error("Could not geocode location or find species.")
@@ -2494,13 +2756,28 @@ else:
                         species_data.append({"Scientific Name": s, "Common Name": colloquial, "Common Name Source": source, "Resolution Status": status})
                     st.write(f"Found {len(species_list)} species")
                     st.dataframe(pd.DataFrame(species_data))
-                num_sequences = st.slider(
-                    "Number of sequences to fetch (COI)",
-                    min_value=1,
-                    max_value=min(100, len(species_list)),
-                    value=min(10, len(species_list)),
-                    key="search_num_sequences"
-                )
+
+                # if we let user select
+                # num_sequences = st.slider(
+                    # "Number of sequences to fetch (COI)",
+                    # min_value=1,
+                    # max_value=min(100, len(species_list)),
+                    # value=min(10, len(species_list)),
+                    # key="search_num_sequences"
+                # )
+
+                if len(species_list) <= 1:
+                    num_sequences = 1 if len(species_list) == 1 else 0
+                    st.info(f"Only {len(species_list)} species available. Setting number of sequences to {num_sequences}.")
+                else:
+                    num_sequences = st.slider(
+                        "Number of sequences to fetch (COI)",
+                        min_value=1,
+                        max_value=min(100, len(species_list)),
+                        value=min(10, len(species_list)),
+                        key="search_num_sequences"
+                    )
+
                 label_type = st.selectbox(
                     "Tree Node Labels",
                     ["Scientific Name", "Common Name", "NCBI Accession"],
@@ -2557,18 +2834,29 @@ else:
                     # Update insight with new labels
                     divergence_insight = f"Tree built from COI sequences of {', '.join([term.name for term in tree.get_terminals()])}"
                     label_to_sci = {v: k for k, v in sci_to_label.items()}
-                    tree_img = render_tree_with_images(newick, f"Evolution for {search}", sci_to_label)
+                    tree_img, leaf_y, label_to_sci = render_tree_with_images(newick, f"Evolution for {search}", sci_to_label)
                     st.write(f"Species Count: {len(species_list)}")
                     st.write(f"Phylogenetic Diversity (PD): {pd_score:.1f}")
                     st.markdown(f"**Evolutionary Insight**: {divergence_insight}")
                     if tree_img:
                         st.image(tree_img, caption=f"Phylogenetic tree showing evolutionary flow for {search}")
+                        # Display larger images below
+                        st.subheader("Larger Species Images (Click browser zoom or right-click to enlarge)")
+                        num_img_cols = 3
+                        img_cols = st.columns(num_img_cols)
+                        for i, (label, y) in enumerate(leaf_y.items()):
+                            taxon = label_to_sci.get(label)
+                            if taxon:
+                                img_path = get_species_image(taxon)
+                                if img_path:
+                                    with img_cols[i % num_img_cols]:
+                                        st.image(img_path, caption=label, width=200)
                 if st.button(f"Fetch Gene Sequences (COI) for Top {num_sequences} Taxa"):
                     # Use species_list and filter valid species, as done in build_phylogenetic_tree
                     valid_species = [s for s in species_list if s != 'Unknown' and is_species_level(s)]
                     if not valid_species:
                         valid_species = [s for s in species_list if s != 'Unknown']
-                 
+              
                     sequences = []
                     failed_taxa = []
                     progress_bar = st.progress(0)
@@ -2585,7 +2873,7 @@ else:
                                 break
                             progress_bar.progress(min((i + 1) / (num_sequences * 10), 1.0))
                         except Exception as seq_e:
-                            print(f"WARNING: Failed to fetch sequence for {taxon}: {seq_e}")
+                            print(f"Failed to fetch sequence for {taxon}: {seq_e}")
                             failed_taxa.append(taxon)
                     progress_bar.empty()
                     if failed_taxa and len(sequences) < num_sequences:
@@ -2616,8 +2904,8 @@ else:
                         st.write("No sequences found.")
             else:
                 st.write(f"No data found for '{search}'. Please try another location or species.")
-         
-         
+      
+      
 # Footer and notes
 st.markdown("""
 **Evolution in Focus**: Explore how ocean features drive marine speciation and genetic adaptations. Click green markers or near blue occurrence points (indicating OBIS data) for real phylogenetic trees. The red polygon shows your search area. Toggle coral reefs or stats for more insights!
@@ -2628,5 +2916,5 @@ st.subheader("Notes Section")
 user_notes = st.text_area("Add your own notes here:", height=100)
 st.markdown("### Opinions on Best Modern Bioinformatics Approach")
 st.markdown("""
-This app emphasizes phylogenetic diversity (PD) for marine conservation, aligning with a 2025 Nature study on preserving evolutionary potential in ocean ecosystems. Incorporating eDNA methods, as seen in 2025 research on fish communities, would enhance biodiversity assessments. Dendropy’s PD calculations (sum of branch lengths) are efficient and align with modern standards. For sequence alignment, MAFFT is recommended over BioPython’s PairwiseAligner for production, as seen in recent fungal diversity studies. TimeTree integration adds temporal depth, reflecting research on marine PD changes. This app (API loads in ~5-10s) balances interactivity and data-driven bioinformatics.
+This app emphasizes phylogenetic diversity (PD) for marine conservation, aligning with a 2025 Nature study on preserving evolutionary potential in ocean ecosystems. Incorporating eDNA methods, as seen in 2025 research on fish communities, as seen in recent fungal diversity studies. TimeTree integration adds temporal depth, reflecting research on marine PD changes. This app (API loads in ~5-10s) balances interactivity and data-driven bioinformatics.
 """)
