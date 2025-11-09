@@ -1,15 +1,35 @@
+import os
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'  # For headless/offscreen rendering; suppresses thread warnings
+
+from qtpy.QtWidgets import QApplication
+app = QApplication.instance()
+if app is None:
+    app = QApplication([])
+
 import streamlit as st
 import folium
 import geopandas as gpd
 import pandas as pd
+import random
 import requests
+from collections import Counter
+import shutil
 from streamlit_folium import st_folium
-import matplotlib.pyplot as plt
-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+# import plotly.figure_factory as ff
+# import plotly.graph_objects as go
+from ete3 import Tree, TreeStyle, TextFace, ImgFace, faces, NodeStyle, AttrFace
+from ete3.parser.newick import NewickError
+from dendropy.calculate import phylogeneticdistance  # For PhylogeneticDistanceMatrix    
+import dendropy
 import io
+import xml.etree.ElementTree as ET
+# Register namespaces to avoid prefixes in output
+ET.register_namespace('', 'http://www.w3.org/2000/svg')
+ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
+
 from PIL import Image
 import base64
-import os
+from contextlib import redirect_stdout, redirect_stderr
 from pyobis import occurrences, checklist
 from Bio import Phylo, Entrez, SeqIO
 from Bio.Align import MultipleSeqAlignment
@@ -27,13 +47,26 @@ import re
 import logging # Add this if not present
 from Bio.Align import PairwiseAligner # Ensure imported for fallback
 from pygbif import occurrences as gbif_occ
+from pygbif import species as gbif_species  # Add this
 import urllib3; urllib3.disable_warnings()
 import urllib.parse
 from branca.element import MacroElement
 from jinja2 import Template
 import json
+import tempfile
+
 from dotenv import load_dotenv  # Add this if you haven't already, to load your .env file
 load_dotenv()  # Call it early in the script
+
+st.set_page_config(layout="wide")
+
+
+class CustomLogger(logging.Logger):
+    def _log(self, level, msg, args, exc_info=None, extra=None, stack_info=False, stacklevel=1, **kwargs):
+        # Ignore any unexpected kwargs like 'end'
+        super()._log(level, msg, args, exc_info=exc_info, extra=extra, stack_info=stack_info, stacklevel=stacklevel)
+
+logging.setLoggerClass(CustomLogger)
 
 # Temporary patch for pyobis logging bug: Redirect tqdm output to avoid invalid kwargs
 class TqdmLoggingHandler(logging.Handler):
@@ -80,7 +113,8 @@ logger.addHandler(TqdmLoggingHandler())
 logger.propagate = False # Prevent double-logging
 email_default = os.getenv("ENTREZ_EMAIL", "")
 Entrez.email = st.text_input("Enter your email for NCBI Entrez", value=email_default)
-Entrez.api_key = os.getenv("ENTREZ_API_KEY")
+api_key_default = os.getenv("ENTREZ_API_KEY", "")
+Entrez.api_key = st.text_input("Enter your NCBI API key (optional, for higher rate limits)", value=api_key_default)
 
 # Streamlit UI setup
 st.title("Ocean Layers: Seafloor & Evolution Explorer")
@@ -1718,7 +1752,7 @@ else:
                             caption_parts.append("No additional details available")
                         caption = " | ".join(caption_parts)
                      
-                        st.image(image_path, use_container_width=True, caption=caption)
+                        st.image(image_path, width='stretch', caption=caption)
                 else:
                     st.warning(f"Image not found: {img_data['file']}")
  
@@ -1773,25 +1807,17 @@ else:
         name=f"{selected_phylum} Density (GBIF)",
         overlay=True,
         control=True,
-        opacity=0.7, # Semi-transparent to see base layers
+        opacity=0.5, # Semi-transparent to see base layers
     ).add_to(m)
     # Add custom attribution control at bottom-left
     AttributionControl().add_to(m)
+
     # Add scale (measure control) 3D user defined points, click to finish
     # MeasureControl(position='bottomleft', primary_length_unit='kilometers', secondary_length_unit=None, primary_area_unit=None, secondary_area_unit=None).add_to(m)
     
     ScaleControl().add_to(m)
-    # m.get_root().header.add_child(folium.Element('<style>.leaflet-bottom .leaflet-control-scale { transform: translateY(-20px); }</style>'))
     m.get_root().header.add_child(folium.Element('<style>.leaflet-control-attribution { background: transparent !important; }</style>'))
 
-
-    # Hardcoded hotspots (replace with json load if file available)
-    hotspots = {
-        "Acanthocephala": [
-            {"lat": 44.65, "lon": -63.57, "region": "Halifax, Canada (Lobster Habitats)"},
-            {"lat": 22.63, "lon": 120.27, "region": "Kaohsiung, Taiwan (Red Snapper Habitats)"}
-        ],
-    }
     phylum_points = phylum_info[selected_phylum]['hotspots']
     hotspot_layer = folium.FeatureGroup(name=f"{selected_phylum} Hotspots").add_to(m)
     for point in phylum_points:
@@ -1872,16 +1898,40 @@ else:
         else:
             st.warning("No shapefiles found in 'data/14_001_WCMC008_CoralReefs2018_v4_1/01_Data'.")
     
+
+    def fetch_habitat(taxon):
+        try:
+            resp = pyworms.aphiaRecordsByName(taxon)
+            if resp:
+                return resp[0].get('environment', 'Unknown')  # Or use OBIS for more detail
+        except:
+            return None
+
     @st.cache_data
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
     def fetch_obis_data(geom, size=500, phylum=None):
+        def clean_taxon(name):
+            if not name:
+                return ''
+            # Remove redundant or any subgenus like "Genus (Subgenus)"
+            name = re.sub(r'(\b[A-Z][a-z]+)\s*\(\w+\)', r'\1', name)
+            # Then, remove trailing authority like "(Author, Year)"
+            name = re.sub(r'\s*\([^)]*\)$', '', name).strip()
+            # Strip to first two words if more than two (for authorities without parens)
+            words = name.split()
+            if len(words) > 2:
+                name = ' '.join(words[:2])
+            return name
+            
         occ_list = []
-        taxa = []
-        fallback_used = False  # New: Flag to track if GBIF fallback was used
+        full_counter = Counter()
+        fallback_used = False
         try:
             print(f"Fetching OBIS data for geometry: {geom} with size={size} scientificname={phylum}")
             query = occurrences.search(geometry=geom, size=size, scientificname=phylum)
-            occ_data = query.execute()
+            with open(os.devnull, 'w') as fnull:
+                with redirect_stdout(fnull), redirect_stderr(fnull):
+                    occ_data = query.execute()
             if isinstance(occ_data, pd.DataFrame):
                 results = occ_data.to_dict('records')
             else:
@@ -1889,52 +1939,43 @@ else:
             print(f'\n\n\nstart test\n\n\n')
             print(f'occ_data\n\n{occ_data}\n\n')
             print(f"Raw OBIS results count: {len(results)}")
-            print(f"Total from API: {occ_data.get('total', 0)}") # Check overall matching count
+            print(f"Total from API: {occ_data.get('total', 0)}")
             print(f"First two results: {results[:2]}")
-            # Check phyla
             phyla = set(rec.get('phylum') for rec in results if rec.get('phylum'))
             print(f"Unique phyla in results: {phyla}")
             if phyla and all(p.lower() == phylum.lower() for p in phyla):
                 print("Success: All results restricted to the phylum!")
             else:
                 print("Issue: Outer phyla or mismatches detected.")
-           
-            # Optional: Print sample records for inspection
             for rec in results[:3]:
                 print(f"Sample: scientificName={rec.get('scientificName')}, phylum={rec.get('phylum')}")
-           
-           
-           
             print(f'stop test\n\n\n')
-            # Extract all scientific names
             for rec in results:
-                if rec: # Skip empty
+                if rec:
                     rec_phylum = rec.get('phylum')
-                    print(f"Record phylum: {rec_phylum}")
                     sci_name = rec.get('scientificName', 'Unknown')
-                    print(f"Adding sci_name: {sci_name}")
+                    cleaned_name = ''
                     if sci_name and sci_name != 'Unknown' and isinstance(sci_name, str):
-                        taxa.append(sci_name.strip())
-             
-                    # For occurrences, use lat/lon and the resolved name
+                        cleaned_name = clean_taxon(sci_name)
+                        full_counter[cleaned_name] += 1
                     lat = rec.get('decimalLatitude')
                     lon = rec.get('decimalLongitude')
                     if lat is not None and lon is not None and isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-                        occ_list.append({'lat': lat, 'lon': lon, 'name': sci_name})
-            taxa = list(set(taxa)) # Dedupe and clean
-            
-            # New: GBIF fallback if OBIS taxa < 5
-            if len(taxa) < 50:
-                fallback_used = True  # Set flag
+                        occ_list.append({'lat': lat, 'lon': lon, 'name': cleaned_name})
+            unique_obis = len(full_counter)
+            print(f'\nFound {unique_obis} unique taxa\n')
+            obis_taxa_set = set(full_counter.keys())
+            if unique_obis < 50:
+                fallback_used = True
                 print("\n\nFalling back to GBIF due to sparse OBIS data")
                 gbif_data = {}
+                base_url = "https://api.gbif.org/v1/occurrence/search"
                 phylum_key = phylum_info[phylum]['gbif_taxon_id']
                 params = {'limit': 500, 'offset': 0}
                 if phylum_key:
                     params['phylumKey'] = phylum_key
                 else:
                     print("Skipping phylum filter due to key fetch failure")
-                
                 geom_encoded = urllib.parse.quote(geom)
                 query_str = urllib.parse.urlencode(params) + "&geometry=" + geom_encoded
                 full_url = base_url + "?" + query_str
@@ -1946,28 +1987,34 @@ else:
                 except Exception as e:
                     print(f"GBIF API error: {e}")
                 gbif_results = gbif_data.get('results', [])
-                # Parse similar to OBIS
                 for rec in gbif_results:
                     sci_name = rec.get('scientificName', 'Unknown')
+                    cleaned_name = ''
                     if sci_name and sci_name != 'Unknown':
-                        taxa.append(sci_name.strip())
+                        cleaned_name = clean_taxon(sci_name)
+                        full_counter[cleaned_name] += 1
                     lat = rec.get('decimalLatitude')
                     lon = rec.get('decimalLongitude')
                     if lat is not None and lon is not None:
-                        occ_list.append({'lat': lat, 'lon': lon, 'name': sci_name})
-                taxa = list(set(taxa))  # Dedupe after merge
-            
-                        
-            if not taxa:
+                        occ_list.append({'lat': lat, 'lon': lon, 'name': cleaned_name})
+                gbif_taxa_set = set(full_counter.keys()) - obis_taxa_set
+                new_taxa_count = len(gbif_taxa_set)
+                print(f"Added {new_taxa_count} new taxa from GBIF")
+                sorted_example = sorted(full_counter, key=full_counter.get, reverse=True)[:5]
+                print(f"Resolved species_list (OBIS + GBIF): {sorted_example}...")
+            if not full_counter:
                 print("No taxa found.")
-                return {'species': [], 'occurrences': [], 'fallback_used': fallback_used}  # Updated return
-            
-            print(f"Resolved to {len(taxa)} taxa names: {taxa[:5]}...")
-            return {'species': taxa, 'occurrences': occ_list, 'fallback_used': fallback_used}  # Updated return
+                return {'species': [], 'occurrences': [], 'fallback_used': fallback_used}
+            print("Taxa ordered by frequency:")
+            for taxon, count in full_counter.most_common():
+                print(f"{taxon}: {count}")
+            sorted_taxa = [taxon for taxon, count in full_counter.most_common()]
+            print(f"Resolved to {len(sorted_taxa)} taxa names: \n{sorted_taxa[:]}\n\n...\n")
+            return {'species': sorted_taxa, 'occurrences': occ_list, 'fallback_used': fallback_used}
         except Exception as e:
             print(f"OBIS API error: {e}")
-            return {'species': [], 'occurrences': [], 'fallback_used': fallback_used}  # Updated return
-      
+            return {'species': [], 'occurrences': [], 'fallback_used': fallback_used}
+
 
 
     def geocode(location):
@@ -1979,14 +2026,17 @@ else:
             if data:
                 return float(data[0]['lat']), float(data[0]['lon'])
         return None
+    
     @lru_cache(maxsize=1000)
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
     def fetch_sequence(taxon):
         """Fetch a single COI sequence for a given taxon from NCBI."""
-        term = f"{taxon}[Organism] AND COI[Gene Name] AND (\"500\"[SLEN] : \"2000\"[SLEN])"
+        cleaned_taxon = re.sub(r'\s*\([^)]*\)$', '', taxon).strip()
+        # term = f"{cleaned_taxon}[Organism] AND COI[Gene Name] AND (\"500\"[SLEN] : \"2000\"[SLEN])"
+        term = f"{cleaned_taxon}[Organism] AND COI[Gene Name] AND 500:2000[SLEN]"
         print(f"Searching NCBI for: {term}")
         try:
-            search_handle = Entrez.esearch(db="nucleotide", term=term, retmax=1, idtype="acc")
+            search_handle = Entrez.esearch(db="nucleotide", term=term, retmax=1)
             search_results = Entrez.read(search_handle)
             search_handle.close()
             id_list = search_results["IdList"]
@@ -1994,12 +2044,12 @@ else:
                 fetch_handle = Entrez.efetch(db="nucleotide", id=id_list[0], rettype="fasta", retmode="text")
                 record = SeqIO.read(fetch_handle, "fasta")
                 fetch_handle.close()
-                print(f"Fetched sequence for {taxon}: {record.id}")
+                print(f"Fetched sequence for {taxon}: {record.id}\n")
                 return record
-            print(f"No sequence found for {taxon}")
+            print(f"No sequence found for {taxon}\n")
             return None
         except Exception as e:
-            print(f"Failed to fetch sequence for {taxon}: {e}")
+            print(f"Failed to fetch sequence for {taxon}: {e}\n")
             return None
     def is_species_level(taxon):
         """Check if taxon is at species level."""
@@ -2087,68 +2137,589 @@ else:
                 if os.path.exists(file):
                     os.remove(file)
             return sequences
-    def render_tree(newick, title):
-        """Render a phylogenetic tree from a Newick string."""
+
+    # def render_cladogram(newick, used_taxa, label_type, dtree):
+        # tree = dendropy.Tree.get(data=newick, schema='newick')
+      
+        # # Ladderize for better ordering (minimize crossings)
+        # tree.ladderize(ascending=True)
+      
+        # # Make the tree ultrametric for cladogram style (topology-only, tips aligned)
+        # def make_ultrametric(node):
+            # if node.is_leaf():
+                # return 0
+            # child_heights = [make_ultrametric(child) for child in node.child_nodes()]
+            # max_ch = max(child_heights) if child_heights else 0
+            # height = 1 + max_ch
+            # for i, child in enumerate(node.child_nodes()):
+                # child.edge.length = height - child_heights[i]
+            # return height
+      
+        # make_ultrametric(tree.seed_node)
+      
+        # # Set proportional depths (now ultrametric, so cladogram with aligned tips)
+        # tree.seed_node.depth = 0.0
+        # for node in tree.preorder_node_iter(filter_fn=lambda n: n != tree.seed_node):
+            # edge_len = node.edge_length if node.edge_length is not None else 1.0 # Unit if missing
+            # node.depth = node.parent_node.depth + edge_len
+      
+        # max_depth = max(n.depth for n in tree.leaf_node_iter())
+      
+        # # Leaves in tree order (after ladderize)
+        # leaves = list(tree.leaf_node_iter())
+      
+        # # Assign y: even spacing
+        # y_spacing = 40.0 # Further increased for normal tree spacing
+        # for i, leaf in enumerate(leaves):
+            # leaf.y = i * y_spacing
+      
+        # # Set x proportional
+        # x_scale = 12.0 # Reduced for better horizontal fitting
+        # for node in tree.postorder_node_iter():
+            # node.x = node.depth * x_scale
+            # if not node.is_leaf():
+                # child_ys = [c.y for c in node.child_nodes()]
+                # node.y = sum(child_ys) / len(child_ys)
+      
+        # max_depth *= x_scale
+      
+        # # Sci to info map
+        # sci_to_info = {taxon: (common, ncbi) for taxon, common, ncbi in used_taxa}
+        # sci_to_label = {}
+        # for taxon in sci_to_info:
+            # common, ncbi = sci_to_info[taxon]
+            # if label_type == "Common Name":
+                # label = f"{common} ({taxon})" if common != 'Unknown' else taxon
+            # elif label_type == "NCBI Accession":
+                # label = ncbi
+            # else:
+                # label = taxon
+            # sci_to_label[taxon] = label
+      
+        # # Collect leaf data with base64 before updating labels
+        # leaf_data = []
+        # for leaf in leaves:
+            # sci = leaf.taxon.label # original sci
+            # new_label = sci_to_label.get(sci, sci)
+            # img_path, _ = get_species_image(sci) # Assuming this function is defined elsewhere
+            # base64_img = ''
+            # if img_path and os.path.exists(img_path):
+                # with open(img_path, "rb") as img_file:
+                    # base64_img = base64.b64encode(img_file.read()).decode('utf-8')
+            # leaf_data.append({'leaf': leaf, 'sci': sci, 'label': new_label, 'base64': base64_img, 'depth': leaf.depth})
+      
+        # # Update labels
+        # for d in leaf_data:
+            # d['leaf'].taxon.label = d['label']
+      
+        # # Calculate max text length for alignment
+        # char_width = 1.0  # Increased for better spacing and to prevent cutoffs
+        # max_text_len = max(len(d['label']) for d in leaf_data) * char_width
+      
+        # # Alignment x for right-aligned labels
+        # padding = 1.0
+        # alignment_x = max_depth + max_text_len + padding
+      
+        # # Prepare Plotly fig
+        # fig = go.Figure()
+      
+        # # Add branches as diagonal lines
+        # for node in tree.preorder_node_iter(filter_fn=lambda n: n != tree.seed_node):
+            # parent = node.parent_node
+            # fig.add_trace(go.Scatter(
+                # x=[parent.x, node.x],
+                # y=[parent.y, node.y],
+                # mode='lines',
+                # line=dict(color='white'),
+                # hoverinfo='none'
+            # ))
+      
+        # # Offset for raising text and images
+        # offset = 5.0
+      
+        # # Add leaf labels, right-aligned at alignment_x
+        # x_labels = [alignment_x for _ in leaf_data]
+        # y_labels = [d['leaf'].y + offset for d in leaf_data]
+        # texts = [d['label'] for d in leaf_data]
+        # customdata = [d['depth'] for d in leaf_data]
+      
+        # fig.add_trace(go.Scatter(
+            # x=x_labels,
+            # y=y_labels,
+            # mode='text',
+            # text=texts,
+            # textposition='middle right',
+            # hovertemplate='%{text}<br>Topological distance from root: %{customdata:.0f}<extra></extra>',
+            # customdata=customdata
+        # ))
+      
+        # # Add images next to names (to the right of alignment_x) if available
+        # img_size_y = 15.0
+        # img_size_x = img_size_y # Assume square; adjust if needed
+        # for d in leaf_data:
+            # if d['base64']:
+                # image_x = alignment_x + 2.0  # Increased gap to prevent any perceived overlay
+                # fig.add_layout_image(
+                    # dict(
+                        # source=f"data:image/png;base64,{d['base64']}",
+                        # xref="x",
+                        # yref="y",
+                        # x=image_x,
+                        # y=d['leaf'].y + offset,
+                        # sizex=img_size_x,
+                        # sizey=img_size_y,
+                        # sizing="contain",
+                        # opacity=1.0,
+                        # layer="above",
+                        # xanchor="left",
+                        # yanchor="middle"
+                    # )
+                # )
+                # # Add invisible clickable annotation over the image for enlargement (opens in new tab)
+                # fig.add_annotation(
+                    # x=image_x + (img_size_x / 2),
+                    # y=d['leaf'].y + offset,
+                    # text=f'<a href="data:image/png;base64,{d["base64"]}" target="_blank" style="opacity: 0.0;">               </a>',  # Spaces for approximate click area width
+                    # showarrow=False,
+                    # xref="x",
+                    # yref="y",
+                    # font=dict(size=img_size_y),  # Size to roughly match image for click area
+                    # align="center"
+                # )
+      
+        # # Layout
+        # fig.update_layout(
+            # showlegend=False,
+            # hovermode='closest',
+            # xaxis={'visible': False, 'range': [0, alignment_x + img_size_x + 10]},  # Extend x range to fit everything
+            # yaxis={'visible': False},
+            # title="Interactive Cladogram (Hover for info)",
+            # template='plotly_dark',
+            # margin=dict(l=0, r=600, t=50, b=0),  # Increased right margin further for long labels/images
+            # height=len(leaves) * y_spacing + 100,  # Dynamic height based on leaves
+            # width=1200  # Fixed wider width to prevent cutoffs; adjust as needed or set to None for auto
+        # )
+        # return fig
+
+    # def render_phylogenetic_tree(newick, used_taxa, label_type, dtree):
+        # tree = dendropy.Tree.get(data=newick, schema='newick')
+       
+        # # Ladderize for better ordering (minimize crossings)
+        # tree.ladderize(ascending=True)
+       
+        # # Skip ultrametric transformation to preserve original branch lengths
+       
+        # # Set depths based on original branch lengths
+        # tree.seed_node.depth = 0.0
+        # for node in tree.preorder_node_iter(filter_fn=lambda n: n != tree.seed_node):
+            # edge_len = node.edge_length if node.edge_length is not None else 1.0 # Unit if missing
+            # node.depth = node.parent_node.depth + edge_len
+       
+        # max_depth = max(n.depth for n in tree.leaf_node_iter())
+       
+        # # Leaves in tree order (after ladderize)
+        # leaves = list(tree.leaf_node_iter())
+       
+        # # Assign y: even spacing
+        # y_spacing = 40.0 # Further increased for normal tree spacing
+        # for i, leaf in enumerate(leaves):
+            # leaf.y = i * y_spacing
+       
+        # # Set x proportional to depth (original branch lengths)
+        # x_scale = 12.0 # Reduced for better horizontal fitting
+        # for node in tree.postorder_node_iter():
+            # node.x = node.depth * x_scale
+            # if not node.is_leaf():
+                # child_ys = [c.y for c in node.child_nodes()]
+                # node.y = sum(child_ys) / len(child_ys)
+       
+        # max_depth *= x_scale
+       
+        # # Sci to info map
+        # sci_to_info = {taxon: (common, ncbi) for taxon, common, ncbi in used_taxa}
+        # sci_to_label = {}
+        # for taxon in sci_to_info:
+            # common, ncbi = sci_to_info[taxon]
+            # if label_type == "Common Name":
+                # label = f"{common} ({taxon})" if common != 'Unknown' else taxon
+            # elif label_type == "NCBI Accession":
+                # label = ncbi
+            # else:
+                # label = taxon
+            # sci_to_label[taxon] = label
+       
+        # # Collect leaf data with base64 before updating labels
+        # leaf_data = []
+        # for leaf in leaves:
+            # sci = leaf.taxon.label # original sci
+            # new_label = sci_to_label.get(sci, sci)
+            # img_path, _ = get_species_image(sci) # Assuming this function is defined elsewhere
+            # base64_img = ''
+            # if img_path and os.path.exists(img_path):
+                # with open(img_path, "rb") as img_file:
+                    # base64_img = base64.b64encode(img_file.read()).decode('utf-8')
+            # leaf_data.append({'leaf': leaf, 'sci': sci, 'label': new_label, 'base64': base64_img, 'depth': leaf.depth})
+       
+        # # Update labels
+        # for d in leaf_data:
+            # d['leaf'].taxon.label = d['label']
+       
+        # # Calculate max text length for alignment
+        # char_width = 0.25 # Slightly increased for more accurate spacing
+        # max_text_len = max(len(d['label']) for d in leaf_data) * char_width
+       
+        # # Alignment x for right-aligned labels (align to the farthest tip)
+        # padding = 1.0
+        # alignment_x = max_depth + max_text_len + padding
+       
+        # # Prepare Plotly fig
+        # fig = go.Figure()
+       
+        # # Add horizontal branches
+        # for node in tree.preorder_node_iter(filter_fn=lambda n: n != tree.seed_node):
+            # parent = node.parent_node
+            # fig.add_trace(go.Scatter(
+                # x=[parent.x, node.x],
+                # y=[node.y, node.y],
+                # mode='lines',
+                # line=dict(color='white'),
+                # hoverinfo='none'
+            # ))
+       
+        # # Add vertical connectors for internal nodes with multiple children
+        # for node in tree.preorder_node_iter():
+            # child_nodes = node.child_nodes()
+            # if len(child_nodes) > 1:
+                # min_y = min(c.y for c in child_nodes)
+                # max_y = max(c.y for c in child_nodes)
+                # fig.add_trace(go.Scatter(
+                    # x=[node.x, node.x],
+                    # y=[min_y, max_y],
+                    # mode='lines',
+                    # line=dict(color='white'),
+                    # hoverinfo='none'
+                # ))
+       
+        # # Offset for raising text and images
+        # offset = 5.0
+       
+        # # Add leaf labels, right-aligned at alignment_x
+        # x_labels = [alignment_x for _ in leaf_data]
+        # y_labels = [d['leaf'].y + offset for d in leaf_data]
+        # texts = [d['label'] for d in leaf_data]
+        # customdata = [d['depth'] for d in leaf_data]
+       
+        # fig.add_trace(go.Scatter(
+            # x=x_labels,
+            # y=y_labels,
+            # mode='text',
+            # text=texts,
+            # textposition='middle right',
+            # hovertemplate='%{text}<br>Divergence from root: %{customdata:.2f}<extra></extra>',
+            # customdata=customdata
+        # ))
+       
+        # # Add images next to names (to the right of alignment_x) if available
+        # img_size_y = 15.0
+        # img_size_x = img_size_y # Assume square; adjust if needed
+        # for d in leaf_data:
+            # if d['base64']:
+                # image_x = alignment_x + 0.5 # Gap after aligned right edge
+                # fig.add_layout_image(
+                    # dict(
+                        # source=f"data:image/png;base64,{d['base64']}",
+                        # xref="x",
+                        # yref="y",
+                        # x=image_x,
+                        # y=d['leaf'].y + offset,
+                        # sizex=img_size_x,
+                        # sizey=img_size_y,
+                        # sizing="contain",
+                        # opacity=1.0,
+                        # layer="above",
+                        # xanchor="left",
+                        # yanchor="middle"
+                    # )
+                # )
+       
+        # # Layout
+        # fig.update_layout(
+            # showlegend=False,
+            # hovermode='closest',
+            # xaxis={'visible': False},
+            # yaxis={'visible': False},
+            # title="Interactive Phylogenetic Tree (Hover for info)",
+            # template='plotly_dark',
+            # margin=dict(l=0, r=400, t=50, b=0) # Increased right margin for labels/images
+        # )
+        # return fig
+    
+
+
+
+
+
+
+    
+    def render_cladogram_ete(newick, used_taxa, label_type, dtree):
+        print(f"render_cladogram_ete Input Newick: {newick}")  # Check if this is empty or looks invalid
+        # Parse the Newick tree with format=1 for internal node names
         try:
-            tree_io = io.StringIO(newick)
-            tree = Phylo.read(tree_io, "newick")
-            num_leaves = len(tree.get_terminals())
-            fig, ax = plt.subplots(figsize=(8, max(6, num_leaves * 0.5)))
-            Phylo.draw(tree, axes=ax, do_show=False)
-            ax.set_title(title)
-            img_buffer = io.BytesIO()
-            plt.savefig(img_buffer, format="png", dpi=300)
-            img_buffer.seek(0)
-            plt.close(fig)
-            return Image.open(img_buffer)
-        except Exception as e:
-            st.warning(f"Tree rendering failed: {e}")
-            return None
-    def render_tree_with_images(newick, title, sci_to_label):
-        tree_io = io.StringIO(newick)
-        tree = Phylo.read(tree_io, "newick")
-        num_leaves = len(tree.get_terminals())
-        fig = plt.figure(figsize=(12, max(6, num_leaves * 0.5)))
-        ax_tree = fig.add_axes([0.05, 0.05, 0.65, 0.9])
-        Phylo.draw(tree, axes=ax_tree, do_show=False)
-        ax_tree.set_title(title)
-        # Extract leaf y positions from text labels
-        leaf_y = {}
-        for text in ax_tree.texts:
-            name = text.get_text()
-            leaf_y[name] = text.get_position()[1]
-        # Create inverse map for taxon lookup
-        label_to_sci = {v: k for k, v in sci_to_label.items()}
-        # Add image axes
-        ax_images = fig.add_axes([0.72, 0.05, 0.2, 0.9], frameon=False)
-        ax_images.set_xlim(-0.1, 1)
-        ax_images.set_ylim(ax_tree.get_ylim())
-        ax_images.set_xticks([])
-        ax_images.set_yticks([])
-        # Place images next to leaves
-        for label, y in leaf_y.items():
-            taxon = label_to_sci.get(label)
-            if taxon:
-                img_path = get_species_image(taxon)
-                if img_path:
-                    try:
-                        img = Image.open(img_path)
-                        # Resize to fixed height for uniform size
-                        target_height = 30 # pixels
-                        width, height = img.size
-                        scale = target_height / height
-                        new_size = (int(width * scale), target_height)
-                        img = img.resize(new_size, Image.LANCZOS)
-                        imagebox = OffsetImage(img, zoom=1)
-                        ab = AnnotationBbox(imagebox, (0, y), xycoords='data', boxcoords="data", pad=0, frameon=False, box_alignment=(0, 0.5))
-                        ax_images.add_artist(ab)
-                    except Exception as e:
-                        print(f"Failed to add image for {taxon}: {e}")
-        img_buffer = io.BytesIO()
-        plt.savefig(img_buffer, format="png", dpi=300)
-        img_buffer.seek(0)
-        plt.close(fig)
-        return Image.open(img_buffer), leaf_y, label_to_sci
+            tree = Tree(newick, format=1)
+            print(tree)  # Prints ASCII representation of the tree structure for verification
+        except NewickError as e:
+            print(f"Newick parsing error: {e}")
+            return "<p>Error parsing Newick: Invalid format. Check base_newick input.</p>"
+        # Ladderize for better ordering (minimize crossings)
+        tree.ladderize()
+        
+        # Make the tree ultrametric for cladogram style (topology-only, tips aligned)
+        def make_ultrametric(node):
+            if node.is_leaf():
+                return 0
+            child_heights = [make_ultrametric(child) for child in node.children]
+            max_ch = max(child_heights) if child_heights else 0
+            height = 1 + max_ch
+            for i, child in enumerate(node.children):
+                child.dist = height - child_heights[i]
+            return height
+        
+        make_ultrametric(tree)
+        
+        # Sci to info map
+        sci_to_info = {taxon: (common, ncbi) for taxon, common, ncbi in used_taxa}
+        sci_to_label = {}
+        for taxon in sci_to_info:
+            common, ncbi = sci_to_info[taxon]
+            if label_type == "Common Name":
+                label = f"{common} ({taxon})" if common != 'Unknown' else taxon
+            elif label_type == "NCBI Accession":
+                label = ncbi
+            else:
+                label = taxon
+            sci_to_label[taxon] = label
+        
+        # Update leaf names and collect paths for images
+        leaf_data = {}
+        for leaf in tree.iter_leaves():
+            sci = leaf.name  # Original sci name
+            new_label = sci_to_label.get(sci, sci)
+            leaf.name = new_label  # Update name (ETE displays this as default TextFace)
+            img_path, _ = get_species_image(sci)
+            if img_path and os.path.exists(img_path):
+                try:
+                    with Image.open(img_path) as img:
+                        if img.height > 0:  # Quick verify
+                            leaf_data[leaf] = img_path
+                except Exception:
+                    pass  # Skip if invalid
+        
+        # Set node styles for white branches with thicker lines
+        for node in tree.traverse():
+            nstyle = NodeStyle()
+            nstyle["hz_line_color"] = "#FFFFFF"
+            nstyle["vt_line_color"] = "#FFFFFF"
+            nstyle["hz_line_width"] = 2
+            nstyle["vt_line_width"] = 2
+            # If internal nodes have labels, make them white (optional)
+            nstyle["fgcolor"] = "#FFFFFF"
+            node.set_style(nstyle)
+        
+        # Custom layout function to add custom text faces (white, larger, italic) and images
+        def custom_layout(node):
+            if node.is_leaf():
+                # Custom text face for leaf names
+                text_face = TextFace(node.name, fsize=14, fgcolor="#FFFFFF", fstyle="italic")
+                text_face.margin_left = 5  # Add some spacing
+                faces.add_face_to_node(text_face, node, column=0, aligned=True)
+                if node in leaf_data:
+                    img_path = leaf_data[node]
+                    img_face = ImgFace(img_path, width=40, height=40)  # Slightly larger images
+                    faces.add_face_to_node(img_face, node, column=1, aligned=True)
+        
+        # Tree style for rectangular cladogram (equal branches, no lengths shown)
+        ts = TreeStyle()
+        ts.mode = "r"  # Rectangular mode
+        ts.show_leaf_name = False  # Disable default to use custom
+        ts.show_branch_length = False  # Hide lengths for topology-only
+        ts.show_scale = False  # Disable scale bar
+        ts.branch_vertical_margin = 30  # Increased spacing for better readability
+        ts.scale = 120  # Slightly increased horizontal scaling
+        ts.layout_fn = custom_layout  # Apply custom faces
+        
+        # Render to a temporary SVG file and read as string
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.svg') as tmpfile:
+            svg_path = tmpfile.name
+        tree.render(svg_path, w=1400, units="px", tree_style=ts)  # Increased width for better layout
+        with open(svg_path, 'r') as f:
+            svg_str = f.read()
+        os.unlink(svg_path)  # Clean up the temp file
+        print(f"Raw SVG length: {len(svg_str)}")
+        print(svg_str[:500])  # Print first 500 chars to check for drawn elements like <line>, <text>, etc.
+        
+        # Parse SVG with namespaces
+        root = ET.fromstring(svg_str)
+        
+        # Make all lines white (for branches and any other lines)
+        for line in root.iter('{http://www.w3.org/2000/svg}line'):
+            line.set('stroke', '#FFFFFF')
+        
+        # Make all text white (for labels and any scale text)
+        for text in root.iter('{http://www.w3.org/2000/svg}text'):
+            text.set('fill', '#FFFFFF')
+        
+        # Make all polylines white if any
+        for poly in root.iter('{http://www.w3.org/2000/svg}polyline'):
+            poly.set('stroke', '#FFFFFF')
+        
+        # Build parent map
+        parent_map = {c: p for p in root.iter() for c in p}
+        
+        # Use full URIs for finding elements
+        images = root.findall(".//{http://www.w3.org/2000/svg}image")
+        for img in images:
+            href = img.get('{http://www.w3.org/1999/xlink}href')
+            if href and href.startswith('data:image'):
+                parent = parent_map[img]
+                a = ET.SubElement(parent, '{http://www.w3.org/2000/svg}a')
+                a.set('{http://www.w3.org/1999/xlink}href', href)
+                a.set('target', '_blank')
+                parent.remove(img)
+                a.append(img)
+        
+        # Get modified SVG str with XML declaration
+        modified_svg = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>' + ET.tostring(root, encoding='unicode', method='xml')
+        
+        return modified_svg
+    
+    def render_phylogenetic_tree_ete(newick, used_taxa, label_type, dtree):
+        print(f"render_phylogenetic_tree_ete Input Newick: {newick}")  # Check if this is empty or looks invalid
+        # Parse the Newick tree with format=1 for internal node names
+        
+        try:
+            tree = Tree(newick, format=1)
+            print(tree)  # Prints ASCII representation of the tree structure for verification
+        except NewickError as e:
+            print(f"Newick parsing error: {e}")
+            return "<p>Error parsing Newick: Invalid format. Check base_newick input.</p>"
+        
+        
+        # Ladderize for better ordering (minimize crossings)
+        tree.ladderize()
+        # Sci to info map (same as before)
+        sci_to_info = {taxon: (common, ncbi) for taxon, common, ncbi in used_taxa}
+        sci_to_label = {}
+        for taxon in sci_to_info:
+            common, ncbi = sci_to_info[taxon]
+            if label_type == "Common Name":
+                label = f"{common} ({taxon})" if common != 'Unknown' else taxon
+            elif label_type == "NCBI Accession":
+                label = ncbi
+            else:
+                label = taxon
+            sci_to_label[taxon] = label
+        
+        # Update leaf names and collect paths for images
+        leaf_data = {}
+        for leaf in tree.iter_leaves():
+            sci = leaf.name  # Original sci name
+            new_label = sci_to_label.get(sci, sci)
+            leaf.name = new_label  # Update name (ETE displays this as default TextFace)
+            img_path, _ = get_species_image(sci)
+            if img_path and os.path.exists(img_path):
+                try:
+                    with Image.open(img_path) as img:
+                        if img.height > 0:  # Quick verify
+                            leaf_data[leaf] = img_path
+                except Exception:
+                    pass  # Skip if invalid
+        
+        # Set node styles for white branches with thicker lines
+        for node in tree.traverse():
+            nstyle = NodeStyle()
+            nstyle["hz_line_color"] = "#FFFFFF"
+            nstyle["vt_line_color"] = "#FFFFFF"
+            nstyle["hz_line_width"] = 2
+            nstyle["vt_line_width"] = 2
+            # If internal nodes have labels, make them white (optional)
+            nstyle["fgcolor"] = "#FFFFFF"
+            node.set_style(nstyle)
+        
+        # Custom layout function to add custom text faces (white, larger, italic), images, and branch lengths
+        def custom_layout(node):
+            if node.is_leaf():
+                # Custom text face for leaf names
+                text_face = TextFace(node.name, fsize=14, fgcolor="#FFFFFF", fstyle="italic")
+                text_face.margin_left = 5  # Add some spacing
+                faces.add_face_to_node(text_face, node, column=0, aligned=True)
+                if node in leaf_data:
+                    img_path = leaf_data[node]
+                    img_face = ImgFace(img_path, width=40, height=40)  # Slightly larger images
+                    faces.add_face_to_node(img_face, node, column=1, aligned=True)
+            else:
+                # Custom face for branch lengths on internal nodes
+                if node.dist > 0:
+                    dist_face = AttrFace("dist", fsize=12, fgcolor="#FFFFFF", formatter="%.4f")
+                    faces.add_face_to_node(dist_face, node, column=0, position="branch-top")
+        
+        # Tree style for rectangular phylogenetic tree (preserves branch lengths)
+        ts = TreeStyle()
+        ts.mode = "r"  # Rectangular mode
+        ts.show_leaf_name = False  # Disable default to use custom
+        ts.show_branch_length = False  # Disable default to use custom
+        ts.show_scale = True  # Explicitly enable scale bar (will be made white via post-processing)
+        ts.branch_vertical_margin = 30  # Increased spacing for better readability
+        ts.scale = 120  # Slightly increased horizontal scaling based on branch lengths
+        ts.layout_fn = custom_layout  # Apply custom faces
+        
+        # Render to a temporary SVG file and read as string
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.svg') as tmpfile:
+            svg_path = tmpfile.name
+        tree.render(svg_path, w=1400, units="px", tree_style=ts)  # Increased width for better layout
+        with open(svg_path, 'r') as f:
+            svg_str = f.read()
+        os.unlink(svg_path)  # Clean up the temp file
+        
+        # Parse SVG with namespaces
+        root = ET.fromstring(svg_str)
+        
+        # Make all lines white (for branches, scale bar, etc.)
+        for line in root.iter('{http://www.w3.org/2000/svg}line'):
+            line.set('stroke', '#FFFFFF')
+        
+        # Make all text white (for labels, branch lengths, scale text, etc.)
+        for text in root.iter('{http://www.w3.org/2000/svg}text'):
+            text.set('fill', '#FFFFFF')
+        
+        # Make all polylines white if any
+        for poly in root.iter('{http://www.w3.org/2000/svg}polyline'):
+            poly.set('stroke', '#FFFFFF')
+        
+        # Build parent map
+        parent_map = {c: p for p in root.iter() for c in p}
+        
+        # Use full URIs for finding elements
+        images = root.findall(".//{http://www.w3.org/2000/svg}image")
+        for img in images:
+            href = img.get('{http://www.w3.org/1999/xlink}href')
+            if href and href.startswith('data:image'):
+                parent = parent_map[img]
+                a = ET.SubElement(parent, '{http://www.w3.org/2000/svg}a')
+                a.set('{http://www.w3.org/1999/xlink}href', href)
+                a.set('target', '_blank')
+                parent.remove(img)
+                a.append(img)
+        
+        # Get modified SVG str with XML declaration
+        modified_svg = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>' + ET.tostring(root, encoding='unicode', method='xml')
+        
+        return modified_svg
+    
+    
+
+
+
+
 
     def circle_to_polygon(lon, lat, radius_km=100, num_points=32):
         points = []
@@ -2264,7 +2835,6 @@ else:
             print(f"DuckDuckGo error for {taxon}: {e}")
         return 'Unknown', 'N/A'
   
-    @lru_cache(maxsize=100) # Cache to avoid redundant OBIS calls
     def resolve_to_species(taxon_list, center_lat, center_lon, max_per_taxon=1):
         """
         Resolve higher-rank taxa to species-level names, preferring those near (center_lat, center_lon).
@@ -2277,29 +2847,28 @@ else:
             list: List of species-level names.
         """
         resolved = []
-        for taxon in set(taxon_list): # Dedupe
-            if not taxon or taxon == 'Unknown' or not isinstance(taxon, str):
+        seen = set()
+        for taxon in taxon_list:
+            if not taxon or taxon == 'Unknown' or not isinstance(taxon, str) or taxon in seen:
                 continue
-            # Skip if already species-level (has space, e.g., "Acanthaster planci")
-            if len(taxon.split()) >= 2 and is_species_level(taxon):
+            seen.add(taxon)
+            # If already species-level, add it
+            if is_species_level(taxon):
                 resolved.append(taxon)
                 continue
-  
+    
             try:
                 # Get AphiaID
                 cl_data = checklist.list(scientificname=taxon).execute()
                 results = cl_data.get('results', [])
-                if not results or not isinstance(results, list):
+                if not results or not isinstance(results, list) or not results[0]:
                     print(f"No valid results for {taxon} in checklist")
-                    continue
-                if not results[0]:
-                    print(f"results[0] is None or falsy for {taxon}")
                     continue
                 aphiaid = results[0].get('aphiaID')
                 if not aphiaid:
                     print(f"No AphiaID for {taxon}")
                     continue
-      
+     
                 # Get child species via OBIS API
                 child_url = f"https://api.obis.org/v3/taxon/{aphiaid}/children?rank=Species"
                 response = requests.get(child_url)
@@ -2310,11 +2879,11 @@ else:
                     print(f"No valid child results for {taxon}")
                     continue
                 child_species = [rec['scientificName'] for rec in child_results if rec.get('taxonRank') == 'Species']
-      
+     
                 if not child_species:
                     print(f"No child species for {taxon}")
                     continue
-      
+     
                 # Filter by proximity (bounding box: ±5° around center)
                 bbox = f"POLYGON(({center_lon-5} {center_lat-5},{center_lon-5} {center_lat+5},{center_lon+5} {center_lat+5},{center_lon+5} {center_lat-5},{center_lon-5} {center_lat-5}))"
                 geo_filtered = []
@@ -2324,80 +2893,160 @@ else:
                         geo_filtered.append(sp)
                         if len(geo_filtered) >= max_per_taxon:
                             break
-      
+     
                 # If no geo-match, pick first species as fallback
                 to_add = geo_filtered if geo_filtered else child_species[:max_per_taxon]
-                resolved.extend(to_add)
+                resolved.extend([sp for sp in to_add if sp not in seen])
+                for sp in to_add:
+                    seen.add(sp)
                 print(f"Resolved {taxon} to: {to_add}")
             except Exception as e:
                 print(f"Resolution failed for {taxon}: {e}")
-        resolved = list(set(resolved)) # Dedupe final list
         if not resolved:
             print("No species resolved; returning original list")
-            return [t for t in taxon_list if isinstance(t, str) and len(t.split()) >= 2] # Keep only species-like
+            return [t for t in taxon_list if isinstance(t, str) and is_species_level(t)] # Keep only species-like
         return resolved
+
     def get_species_image(taxon):
-        """Fetch a thumbnail image URL for the species from WoRMS or Wikimedia Commons, save locally."""
+        """Fetch a thumbnail image for the species from GBIF (first), WoRMS, or Wikimedia Commons, save locally with attribution."""
         colloquial, _ = fetch_colloquial_name(taxon)
         search_term = colloquial if colloquial != 'Unknown' else taxon
         img_url = None
-        # Prioritize WoRMS
+        source = None
+        attribution = "No attribution available"
+        placeholder_path = './data/placeholder.png' # Assume this exists or create a placeholder
+    
+        img_dir = './data/imgdownloads'
+        os.makedirs(img_dir, exist_ok=True)
+        filename = taxon.replace(' ', '_') + '.jpg' # Default to jpg
+        filepath = os.path.join(img_dir, filename)
+        json_path = filepath + '.json'
+    
+        # Caching check
+        if os.path.exists(filepath) and os.path.exists(json_path):
+            with open(json_path, 'r') as f:
+                attr_data = json.load(f)
+                attribution = attr_data.get('attribution', "Cached attribution")
+            return filepath, attribution
+    
+        # 1. Try GBIF first
         try:
-            resp = pyworms.aphiaRecordsByName(taxon, marine_only=False)
-            if resp and isinstance(resp, list) and len(resp) > 0:
-                aphia_id = resp[0].get('AphiaID')
-                if aphia_id:
-                    worms_url = f"https://www.marinespecies.org/aphia.php?p=taxdetails&id={aphia_id}"
-                    response = requests.get(worms_url)
-                    if response.ok:
-                        html = response.text
-                        # Adjusted regex to match the gallery class
-                        match = re.search(r'<div[^>]*class="gallery"[^>]*>.*?<img\s+[^>]*src="([^"]+)"', html, re.S | re.I)
-                        if match:
-                            img_src = match.group(1)
-                            if not img_src.startswith('http'):
-                                img_src = 'https://www.marinespecies.org' + img_src
-                            img_url = img_src
+            backbone = gbif_species.name_backbone(name=taxon)
+            key = backbone.get('usageKey') if backbone.get('matchType') != 'NONE' else phylum_info.get(selected_phylum, {}).get('gbif_taxon_id')
+            if key:
+                occ_data = gbif_occ.search(taxonKey=key, mediaType='StillImage', limit=1)
+                results = occ_data.get('results', [])
+                if results and 'multimediaItems' in results[0] and results[0]['multimediaItems']:
+                    img_url = results[0]['multimediaItems'][0]['identifier']
+                    source = 'GBIF'
+                    # Attribution from metadata if available
+                    media = results[0]['multimediaItems'][0]
+                    author = media.get('creator', '') or media.get('publisher', '')
+                    license = media.get('license', '') or media.get('rights', '')
+                    attribution = f"From {source}, {author} ({license})" if author or license else f"From {source}"
+                    print(f"Successfully fetched image from GBIF for {taxon}")
         except Exception as e:
-            print(f"Failed to fetch WoRMS image for {taxon}: {e}")
-        # Fallback to Wikimedia Commons search
+            print(f"Failed GBIF for {taxon}: {e}")
+    
+        # 2. Then WoRMS (scrape)
+        if not img_url:
+            try:
+                resp = pyworms.aphiaRecordsByName(taxon, marine_only=False)
+                if resp and isinstance(resp, list) and len(resp) > 0:
+                    aphia_id = resp[0].get('AphiaID')
+                    if aphia_id:
+                        worms_url = f"https://www.marinespecies.org/aphia.php?p=taxdetails&id={aphia_id}"
+                        response = requests.get(worms_url)
+                        if response.ok:
+                            html = response.text
+                            match = re.search(r'<div[^>]*class="gallery"[^>]*>.*?<img\s+[^>]*src="([^"]+)"', html, re.S | re.I)
+                            if match:
+                                img_src = match.group(1)
+                                if not img_src.startswith('http'):
+                                    img_src = 'https://www.marinespecies.org' + img_src
+                                img_url = img_src
+                                source = 'WoRMS'
+                                # Attribution: Scrape if possible, else default
+                                attr_match = re.search(r'Photo by\s+([^<]+)', html, re.I)
+                                author = attr_match.group(1) if attr_match else ''
+                                license_match = re.search(r'License:\s+([^<]+)', html, re.I)
+                                license = license_match.group(1) if license_match else ''
+                                attribution = f"From {source}, {author} ({license})" if author or license else f"From {source}"
+                                print(f"Successfully fetched image from WoRMS for {taxon}")
+            except Exception as e:
+                print(f"Failed WoRMS for {taxon}: {e}")
+    
+        # 3. Then Wikimedia
         if not img_url:
             try:
                 search_url = f"https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(search_term)}&srnamespace=6&format=json&srlimit=1"
-                resp = requests.get(search_url).json()
-                search_results = resp['query']['search']
+                resp = requests.get(search_url)
+                if not resp.ok:
+                    print(f"Wikimedia search failed with status {resp.status_code} for {taxon}")
+                    pass  # Or return placeholder_path, "Placeholder" to skip entirely
+                data = resp.json()
+                search_results = data.get('query', {}).get('search', [])
                 if search_results:
                     title = requests.utils.quote(search_results[0]['title'])
-                    image_url = f"https://commons.wikimedia.org/w/api.php?action=query&titles={title}&prop=imageinfo&iiprop=url&iiurlwidth=200&format=json"
-                    img_resp = requests.get(image_url).json()
-                    pages = img_resp['query']['pages']
+                    image_url = f"https://commons.wikimedia.org/w/api.php?action=query&titles={title}&prop=imageinfo&iiprop=url|user|extmetadata&format=json"
+                    img_resp = requests.get(image_url)
+                    if not img_resp.ok:
+                        print(f"Wikimedia imageinfo failed with status {img_resp.status_code} for {taxon}")
+                        pass  # Or return placeholder_path, "Placeholder"
+                    img_data = img_resp.json()
+                    # Proceed with parsing
+                    pages = img_data['query']['pages']  # Fixed: use img_data, not img_resp
                     for page in pages.values():
                         if 'imageinfo' in page:
-                            img_url = page['imageinfo'][0]['thumburl']
+                            img_url = page['imageinfo'][0]['url']  # Full URL instead of thumb
+                            source = 'Wikimedia'
+                            metadata = page['imageinfo'][0].get('extmetadata', {})
+                            author = metadata.get('Artist', {}).get('value', '').strip()
+                            license = metadata.get('LicenseShortName', {}).get('value', '') or metadata.get('License', {}).get('value', '')
+                            attribution = f"From {source}, {author} ({license})" if author or license else f"From {source}"
+                            print(f"Successfully fetched image from Wikimedia for {taxon}")
             except Exception as e:
-                print(f"Failed to fetch Wikimedia Commons image for {search_term}: {e}")
+                print(f"Failed Wikimedia for {taxon}: {e}")
+    
         if img_url:
-            # Determine extension
-            ext = img_url.split('.')[-1].split('?')[0]
-            if len(ext) > 4: # Invalid ext
-                ext = 'jpg'
-            filename = taxon.replace(' ', '_') + '.' + ext
-            img_dir = './data/imgdownloads'
-            os.makedirs(img_dir, exist_ok=True)
-            filepath = os.path.join(img_dir, filename)
-            if not os.path.exists(filepath):
-                try:
-                    response = requests.get(img_url, timeout=5)
-                    if response.ok:
-                        with open(filepath, 'wb') as f:
-                            f.write(response.content)
-                except Exception as e:
-                    print(f"Failed to download image for {taxon}: {e}")
-                    return None
-            return filepath
-        return None
+            try:
+                response = requests.get(img_url, timeout=5)
+                if response.ok:
+                    img = Image.open(io.BytesIO(response.content))
+                    # Resize to 20px height
+                    width, height = img.size
+                    if height == 0:  # Rare safeguard for invalid originals
+                        raise ValueError("Image height is zero")
+                    new_height = 20
+                    new_width = max(1, int(width * (new_height / height)))  # Ensure min width 1
+                    img = img.resize((new_width, new_height), Image.LANCZOS)
+                    img.save(filepath)
+                    # Save attribution
+                    with open(json_path, 'w') as f:
+                        json.dump({'attribution': attribution}, f)
+                    print(f"Successfully downloaded and saved image for {taxon}")
+                    return filepath, attribution
+            except Exception as e:
+                print(f"Failed to download/resize image for {taxon}: {e}")
+        
+
+        if not os.path.exists(placeholder_path):
+            from PIL import Image, ImageDraw
+            img = Image.new('RGB', (20, 20), color=(128, 128, 128))  # Gray square
+            draw = ImageDraw.Draw(img)
+            draw.text((2, 2), "?", fill=(255, 255, 255))  # Optional question mark
+            img.save(placeholder_path)
+            print("Created missing placeholder image.")
+        # Fallback to placeholder (now cache it per taxon)
+        if os.path.exists(placeholder_path):
+            shutil.copy(placeholder_path, filepath)  # Copy placeholder to taxon-specific path
+            with open(json_path, 'w') as f:
+                json.dump({'attribution': "Placeholder"}, f)
+            print(f"Cached placeholder for {taxon}")
+        return filepath, "Placeholder"
+    
     def build_phylogenetic_tree(species_list, num_sequences, region, center_lat=None, center_lon=None):
-        """
+        """ new
         Build a phylogenetic tree from COI sequences for given species. Always uses scientific names for labels during construction.
         Args:
             species_list (list): List of taxa from OBIS.
@@ -2406,11 +3055,12 @@ else:
             center_lat (float): Latitude of clicked point (optional).
             center_lon (float): Longitude of clicked point (optional).
         Returns:
-            tuple: (newick string with scientific labels, phylogenetic diversity score, insight message with scientific names, used_taxa)
+            tuple: (newick string with scientific labels, phylogenetic diversity score, insight message with scientific names, used_taxa, dtree)
         """
         if not species_list or all(s == 'Unknown' for s in species_list):
             st.warning(f"No valid species found for {region}. Cannot build phylogenetic tree.")
-            return None, 0.0, "No valid species data available.", []
+            return None, 0.0, "No valid species data available.", [], None  # Added None for dtree
+        
         # Resolve higher ranks to species, using geographic context if provided
         if center_lat is not None and center_lon is not None:
             with st.spinner("Resolving higher-rank taxa to species..."):
@@ -2421,45 +3071,58 @@ else:
                 else:
                     st.info(f"Resolved to {len(species_list)} species-level taxa for {region}.")
                     print(f"Resolved species: {species_list[:5]}...")
+        
         valid_species = [s for s in species_list if s != 'Unknown' and is_species_level(s)]
         if not valid_species:
             valid_species = [s for s in species_list if s != 'Unknown']
-        if not valid_species:
-            st.warning(f"No valid taxa found for {region}. Cannot build phylogenetic tree.")
-            return None, 0.0, "No valid taxa data available.", []
+        
+        # commented to prioritize the higher frequency species
+        # random.shuffle(valid_species)  # Shuffle to randomize selection
+        
         sequences = []
         used_taxa = []
         failed_taxa = []
         progress_bar = st.progress(0)
         target_sequences = min(num_sequences, len(valid_species))
-        for i, taxon in enumerate(valid_species[:target_sequences * 10]):
+        fetched_count = 0
+        for i, taxon in enumerate(valid_species):
+            if fetched_count >= target_sequences:
+                break
             try:
                 record = fetch_sequence(taxon)
                 if record:
                     colloquial, source = fetch_colloquial_name(taxon)
                     ncbi_id = record.id
-                    label = taxon # Always use scientific name for building
+                    label = taxon
                     record.id = label
                     record.name = label
                     sequences.append(record)
                     used_taxa.append((taxon, colloquial, ncbi_id))
+                    fetched_count += 1
                 else:
                     failed_taxa.append(taxon)
-                if len(sequences) >= target_sequences:
-                    break
-                progress_bar.progress(min((i + 1) / (target_sequences * 10), 1.0))
+                progress_bar.progress(min((i + 1) / len(valid_species), 1.0))
             except Exception as seq_e:
                 print(f"Failed to fetch sequence for {taxon}: {seq_e}")
                 failed_taxa.append(taxon)
         progress_bar.empty()
+        lenused_taxa = len(used_taxa)
+        print(f'\nCompleted NCBI seq search: {used_taxa} \nGot:{lenused_taxa}\n')
+        
+        # Pre-cache images
+        for taxon, _, _ in used_taxa:
+            get_species_image(taxon)
+        
         if failed_taxa and len(sequences) < target_sequences:
             st.warning(
                 f"Could not fetch sequences for {len(failed_taxa)} taxa (e.g., {', '.join(failed_taxa[:3])}). "
                 f"Only {len(sequences)} sequences retrieved."
             )
+        
         if len(sequences) < 2:
             st.warning(f"Insufficient sequences ({len(sequences)}) to build a tree for {region}.")
-            return None, 0.0, f"Only {len(sequences)} sequences retrieved; minimum 2 required.", []
+            return None, 0.0, f"Only {len(sequences)} sequences retrieved; minimum 2 required.", [], None  # Added None for dtree
+        
         try:
             with st.spinner("Aligning sequences and building tree..."):
                 aligned_sequences = align_sequences(sequences)
@@ -2481,13 +3144,29 @@ else:
                 newick = output.getvalue().strip()
                 dtree = dendropy.Tree.get(data=newick, schema='newick')
                 pd_score = sum(e.length for e in dtree.edges() if e.length is not None)
-                pd_score = 0.0 if math.isnan(pd_score) or pd_score is None else pd_score # Handle NaN
+                pd_score = 0.0 if math.isnan(pd_score) or pd_score is None else pd_score
                 divergence_insight = f"Tree built from COI sequences of {', '.join([s.name for s in sequences])}"
-                print(f"Built tree with PD score: {pd_score}")
-                return newick, pd_score, divergence_insight, used_taxa
+                print(f"\nBuilt tree with PD score: {pd_score}\nUsing: {used_taxa}\n")
+                return newick, pd_score, divergence_insight, used_taxa, dtree  # Add dtree return for closest relatives
         except Exception as e:
             st.warning(f"Tree construction failed for {region}: {e}.")
-            return None, 0.0, f"Tree construction failed: {str(e)}", []
+            return None, 0.0, f"Tree construction failed: {str(e)}", [], None  # Added None for dtree
+
+
+    def get_closest_from_tree(dtree, target_label, top_n=2):
+        target_node = dtree.find_node_with_taxon_label(target_label)
+        if not target_node:
+            return []
+        pdm = phylogeneticdistance.PhylogeneticDistanceMatrix.from_tree(dtree)
+        distances = []
+        for leaf in dtree.leaf_node_iter():
+            if leaf.taxon.label != target_label:
+                dist = pdm.distance(target_node.taxon, leaf.taxon)
+                distances.append((leaf.taxon.label, dist))
+        distances.sort(key=lambda x: x[1])
+        return [name for name, _ in distances[:top_n]]
+
+
     # Global marine habitat stats
     if show_stats:
         st.subheader("Global Marine Habitat Coverage")
@@ -2616,27 +3295,32 @@ else:
                 radius_km = new_radius # Update for display
             pd_score = 0.0
             if species_list:
-                with st.expander("Species at Clicked Location"):
-                    species_data = []
-                    for s in species_list:
-                        colloquial, source = fetch_colloquial_name(s) if s != 'Unknown' else ('Unknown', 'N/A')
-                        status = "Direct from OBIS" if len(s.split()) >= 2 else "Resolved via OBIS API"
-                        species_data.append({"Scientific Name": s, "Common Name": colloquial, "Common Name Source": source, "Resolution Status": status})
-                    st.write(f"Found {len(species_list)} species")
-                    st.dataframe(pd.DataFrame(species_data))
-    
-                if len(species_list) <= 1:
-                    num_sequences = 1 if len(species_list) == 1 else 0
-                    st.info(f"Only {len(species_list)} species available. Setting number of sequences to {num_sequences}.")
-                else:
-                    num_sequences = st.slider(
-                        "Number of sequences to fetch for tree (COI)",
-                        min_value=1,
-                        max_value=min(100, len(species_list)),
-                        value=min(10, len(species_list)),
-                        key=f"num_sequences_{st.session_state.click_counter}"
-                    )
-        
+                st.subheader(f"{len(species_list)} Species at Clicked Location")
+                species_data = []
+                for s in species_list:
+                    colloquial, source = fetch_colloquial_name(s) if s != 'Unknown' else ('Unknown', 'N/A')
+                    status = "Direct from OBIS" if len(s.split()) >= 2 else "Resolved via OBIS API"
+                    species_data.append({
+                        "Scientific Name": s,
+                        "Common Name": colloquial,
+                        "Common Name Source": source,
+                        "Resolution Status": status
+                    })
+                st.dataframe(pd.DataFrame(species_data))
+                
+                # if len(species_list) <= 1:
+                num_sequences = min(10, len(species_list))
+                # num_sequences = 1 if len(species_list) == 1 else 0
+                st.info(f"{len(species_list)} unique species found. Setting number of sequences for tree building to {num_sequences}.")
+                # else:
+                    # num_sequences = st.slider(
+                        # "Number of sequences to fetch for tree (COI)",
+                        # min_value=1,
+                        # # max_value=min(100, len(species_list)),
+                        # max_value=10,
+                        # value=min(10, len(species_list)),
+                        # key=f"num_sequences_{st.session_state.click_counter}"
+                    # )
 
                 label_type = st.selectbox(
                     "Tree Node Labels",
@@ -2647,27 +3331,24 @@ else:
                     st.warning(f"Fetching {num_sequences} sequences may take several minutes. Please be patient.")
                 tree_key = f"tree_base_{st.session_state.click_counter}"
                 if tree_key not in st.session_state:
-                    base_newick, pd_score, base_insight, used_taxa = build_phylogenetic_tree(
+                    base_newick, pd_score, base_insight, used_taxa, dtree = build_phylogenetic_tree(
                         species_list, num_sequences, "Clicked Location", clicked_lat, clicked_lon
                     )
                     st.session_state[tree_key] = {
                         "base_newick": base_newick,
                         "pd_score": pd_score,
-                        "used_taxa": used_taxa
+                        "used_taxa": used_taxa,
+                        "dtree": dtree
                     }
                 else:
                     cached = st.session_state[tree_key]
                     base_newick = cached["base_newick"]
                     pd_score = cached["pd_score"]
                     used_taxa = cached["used_taxa"]
+                    dtree = cached["dtree"]
                 if base_newick:
-                    # Load base tree (with scientific names)
-                    tree_io = io.StringIO(base_newick)
-                    tree = Phylo.read(tree_io, "newick")
-                    # Get leaf order based on scientific names
-                    leaf_order = [term.name for term in tree.get_terminals()]
-                    # Create mapping from scientific to selected label
                     sci_to_label = {}
+                    labels = []
                     for taxon, colloquial, ncbi_id in used_taxa:
                         if label_type == "Common Name":
                             label = f"{colloquial} ({taxon})" if colloquial != 'Unknown' else taxon
@@ -2676,34 +3357,105 @@ else:
                         else:
                             label = taxon
                         sci_to_label[taxon] = label
-                    # Relabel terminals
-                    for term in tree.get_terminals():
-                        sci_name = term.name
-                        if sci_name in sci_to_label:
-                            term.name = sci_to_label[sci_name]
-                    # Write new newick
-                    output = io.StringIO()
-                    Phylo.write(tree, output, 'newick')
-                    newick = output.getvalue().strip()
-                    # Update insight with new labels
-                    divergence_insight = f"Tree built from COI sequences of {', '.join([term.name for term in tree.get_terminals()])}"
-                    label_to_sci = {v: k for k, v in sci_to_label.items()}
-                    tree_img, leaf_y, label_to_sci = render_tree_with_images(newick, "Phylogenetic Tree at Clicked Location", sci_to_label)
+                        labels.append(label)
+                    divergence_insight = f"Tree built from COI sequences of {', '.join(labels)}"
+                    
+
+                    print(f'\nnewick:\n{base_newick}\n\n')
+
+                    # Render and display both trees
+                    # clad_fig = render_cladogram(base_newick, used_taxa, label_type, dtree)
+                    # phylo_fig = render_phylogenetic_tree(base_newick, used_taxa, label_type, dtree)
+                    # st.image(phylo_img, use_column_width=True, caption="Interactive Phylogenetic Tree (Hover/zoom in browser if needed)")
+                    # # Option 1: Display sequentially (simple, one on top of the other)
+                    # st.subheader("Cladogram")
+                    # st.plotly_chart(clad_svg, use_container_width=True)
+                    
+                    # st.subheader("Phylogenetic Tree")
+                    # st.plotly_chart(phylo_svg, use_container_width=True)
+                    
+
+                    # Render and display both as SVG
+                    clad_svg = render_cladogram_ete(base_newick, used_taxa, label_type, dtree)
+                    st.subheader("Cladogram")
+                    st.markdown(f'<div>{clad_svg}</div>', unsafe_allow_html=True)
+                    
+                    phylo_svg = render_phylogenetic_tree_ete(base_newick, used_taxa, label_type, dtree)
+                    st.subheader("Phylogenetic Tree")
+                    st.markdown(f'<div>{phylo_svg}</div>', unsafe_allow_html=True)
+
+
+
+
+
+                    # Option 2: Display side-by-side (better for comparison; adjust widths as needed)
+                    # col1, col2 = st.columns(2)
+                    # with col1:
+                    #     st.subheader("Cladogram")
+                    #     st.plotly_chart(clad_fig, use_container_width=True)
+                    # with col2:
+                    #     st.subheader("Phylogenetic Tree")
+                    #     st.plotly_chart(phylo_fig, use_container_width=True)
+                    
                     st.write(f"Phylogenetic Diversity: {pd_score:.1f}")
                     st.write(divergence_insight)
-                    if tree_img:
-                        st.image(tree_img)
-                        # Display larger images below
-                        st.subheader("Larger Species Images (Click browser zoom or right-click to enlarge)")
-                        num_img_cols = 3
-                        img_cols = st.columns(num_img_cols)
-                        for i, (label, y) in enumerate(leaf_y.items()):
-                            taxon = label_to_sci.get(label)
-                            if taxon:
-                                img_path = get_species_image(taxon)
+
+
+                    # fig = render_interactive_tree(base_newick, used_taxa, label_type, dtree)  # dtree from build
+                    # st.plotly_chart(fig)
+                    # st.write(f"Phylogenetic Diversity: {pd_score:.1f}")
+                    # st.write(divergence_insight)
+                    
+
+                    # Add Species Explorer (carousel + details)
+                    st.subheader("Species Explorer")
+                    if used_taxa:
+                        taxa_list = [taxon for taxon, _, _ in used_taxa]
+                        cols = st.columns(len(used_taxa))
+                        has_images = False
+                        for i, (taxon, common, ncbi) in enumerate(used_taxa):
+                            img_path, attr = get_species_image(taxon)
+                            label = sci_to_label[taxon]
+                            if img_path and img_path != './data/placeholder.png':  # Skip if placeholder
+                                has_images = True
+                                with cols[i]:
+                                    st.image(img_path, width=50, caption=label)
+                                    if st.button("Select", key=f"select_{taxon}_{st.session_state.click_counter}_{i}"):  # Add i for uniqueness
+                                        st.session_state.selected_species = taxon
+                        if not has_images:
+                            st.info("No images available; showing text-only details.")
+                            # Show text details for all or select via dropdown
+                            selected_taxon = st.selectbox("Select Species for Details", taxa_list, key=f"select_details_{st.session_state.click_counter}")
+                            # Display details (similar below)
+                        else:
+                            # Cycle button
+                            if 'selected_species' in st.session_state:
+                                current_idx = taxa_list.index(st.session_state.selected_species)
+                                if st.button("Next"):
+                                    next_idx = (current_idx + 1) % len(taxa_list)
+                                    st.session_state.selected_species = taxa_list[next_idx]
+                                    st.rerun()
+                        
+                        # Details panel
+                        if 'selected_species' in st.session_state or not has_images:
+                            selected = st.session_state.get('selected_species', taxa_list[0]) if has_images else selected_taxon
+                            common = next(c for t, c, _ in used_taxa if t == selected)
+                            img_path, attr = get_species_image(selected)
+                            closest = get_closest_from_tree(dtree, selected)
+                            # Habitat: Quick fetch or fallback
+                            habitat = fetch_habitat(selected) or phylum_info[selected_phylum]['habitable_areas']  # Define fetch_habitat if needed (e.g., OBIS/WoRMS query)
+                            col1, col2 = st.columns(2)
+                            with col1:
                                 if img_path:
-                                    with img_cols[i % num_img_cols]:
-                                        st.image(img_path, caption=label, width=200)
+                                    st.image(img_path, width=300, caption=f"{common} | {attr}")
+                                else:
+                                    st.write("No image available.")
+                            with col2:
+                                st.write(f"Scientific: {selected}, Common: {common}")
+                                st.write(f"Habitat: {habitat}")
+                                st.write(f"Closest relatives: {', '.join(closest)}")
+
+
                 clicked_cluster = MarkerCluster(name="Clicked Occurrences").add_to(click_layer)
                 for occ in occ_list:
                     folium.Marker(
@@ -2720,6 +3472,8 @@ else:
                 "PD Score": pd_score
             })
         st_folium(m, width=700, height=500, returned_objects=["last_clicked"], key=f"main_map_{st.session_state.click_counter}")
+
+
     # Search by location or species
     st.subheader("Explore Evolution by Location or Species")
     search = st.text_input("Enter a location or species (e.g., 'Great Barrier Reef' or 'Mola mola')")
@@ -2773,7 +3527,8 @@ else:
                     num_sequences = st.slider(
                         "Number of sequences to fetch (COI)",
                         min_value=1,
-                        max_value=min(100, len(species_list)),
+                        # max_value=min(100, len(species_list)),
+                        max_value=10,
                         value=min(10, len(species_list)),
                         key="search_num_sequences"
                     )
@@ -2793,27 +3548,24 @@ else:
                 if st.session_state.get(tree_key) is None:
                     lat = coord[0] if 'coord' in locals() and coord else None
                     lon = coord[1] if 'coord' in locals() and coord else None
-                    base_newick, pd_score, base_insight, used_taxa = build_phylogenetic_tree(
+                    base_newick, pd_score, base_insight, used_taxa, dtree = build_phylogenetic_tree(
                         species_list, num_sequences, search, lat, lon
                     )
                     st.session_state[tree_key] = {
                         "base_newick": base_newick,
                         "pd_score": pd_score,
-                        "used_taxa": used_taxa
+                        "used_taxa": used_taxa,
+                        "dtree": dtree
                     }
                 else:
                     cached = st.session_state[tree_key]
                     base_newick = cached["base_newick"]
                     pd_score = cached["pd_score"]
                     used_taxa = cached["used_taxa"]
+                    dtree = cached["dtree"]
                 if base_newick:
-                    # Load base tree (with scientific names)
-                    tree_io = io.StringIO(base_newick)
-                    tree = Phylo.read(tree_io, "newick")
-                    # Get leaf order based on scientific names
-                    leaf_order = [term.name for term in tree.get_terminals()]
-                    # Create mapping from scientific to selected label
                     sci_to_label = {}
+                    labels = []
                     for taxon, colloquial, ncbi_id in used_taxa:
                         if label_type == "Common Name":
                             label = f"{colloquial} ({taxon})" if colloquial != 'Unknown' else taxon
@@ -2822,41 +3574,67 @@ else:
                         else:
                             label = taxon
                         sci_to_label[taxon] = label
-                    # Relabel terminals
-                    for term in tree.get_terminals():
-                        sci_name = term.name
-                        if sci_name in sci_to_label:
-                            term.name = sci_to_label[sci_name]
-                    # Write new newick
-                    output = io.StringIO()
-                    Phylo.write(tree, output, 'newick')
-                    newick = output.getvalue().strip()
-                    # Update insight with new labels
-                    divergence_insight = f"Tree built from COI sequences of {', '.join([term.name for term in tree.get_terminals()])}"
-                    label_to_sci = {v: k for k, v in sci_to_label.items()}
-                    tree_img, leaf_y, label_to_sci = render_tree_with_images(newick, f"Evolution for {search}", sci_to_label)
+                        labels.append(label)
+                    divergence_insight = f"Tree built from COI sequences of {', '.join(labels)}"
+                    
+                    fig = render_interactive_tree(base_newick, used_taxa, label_type, dtree)  # dtree from build
+                    st.plotly_chart(fig)
                     st.write(f"Species Count: {len(species_list)}")
                     st.write(f"Phylogenetic Diversity (PD): {pd_score:.1f}")
                     st.markdown(f"**Evolutionary Insight**: {divergence_insight}")
-                    if tree_img:
-                        st.image(tree_img, caption=f"Phylogenetic tree showing evolutionary flow for {search}")
-                        # Display larger images below
-                        st.subheader("Larger Species Images (Click browser zoom or right-click to enlarge)")
-                        num_img_cols = 3
-                        img_cols = st.columns(num_img_cols)
-                        for i, (label, y) in enumerate(leaf_y.items()):
-                            taxon = label_to_sci.get(label)
-                            if taxon:
-                                img_path = get_species_image(taxon)
+                    
+                    # Add Species Explorer (carousel + details)
+                    st.subheader("Species Explorer")
+                    if used_taxa:
+                        taxa_list = [taxon for taxon, _, _ in used_taxa]
+                        cols = st.columns(len(used_taxa))
+                        has_images = False
+                        for i, (taxon, common, ncbi) in enumerate(used_taxa):
+                            img_path, attr = get_species_image(taxon)
+                            label = sci_to_label[taxon]
+                            if img_path and img_path != './data/placeholder.png':  # Skip if placeholder
+                                has_images = True
+                                with cols[i]:
+                                    st.image(img_path, width=50, caption=label)
+                                    if st.button("Select", key=f"select_{taxon}_search_{i}"):  # Add i for uniqueness
+                                        st.session_state.selected_species = taxon
+                        if not has_images:
+                            st.info("No images available; showing text-only details.")
+                            selected_taxon = st.selectbox("Select Species for Details", taxa_list, key="select_details_search")
+                            # Display details
+                        else:
+                            # Cycle button
+                            if 'selected_species' in st.session_state:
+                                current_idx = taxa_list.index(st.session_state.selected_species)
+                                if st.button("Next"):
+                                    next_idx = (current_idx + 1) % len(taxa_list)
+                                    st.session_state.selected_species = taxa_list[next_idx]
+                                    st.rerun()
+                        
+                        # Details panel
+                        if 'selected_species' in st.session_state or not has_images:
+                            selected = st.session_state.get('selected_species', taxa_list[0]) if has_images else selected_taxon
+                            common = next(c for t, c, _ in used_taxa if t == selected)
+                            img_path, attr = get_species_image(selected)
+                            closest = get_closest_from_tree(dtree, selected)
+                            # Habitat: Quick fetch or fallback
+                            habitat = fetch_habitat(selected) or phylum_info[selected_phylum]['habitable_areas']  # Define fetch_habitat if needed
+                            col1, col2 = st.columns(2)
+                            with col1:
                                 if img_path:
-                                    with img_cols[i % num_img_cols]:
-                                        st.image(img_path, caption=label, width=200)
+                                    st.image(img_path, width=300, caption=f"{common} | {attr}")
+                                else:
+                                    st.write("No image available.")
+                            with col2:
+                                st.write(f"Scientific: {selected}, Common: {common}")
+                                st.write(f"Habitat: {habitat}")
+                                st.write(f"Closest relatives: {', '.join(closest)}")
                 if st.button(f"Fetch Gene Sequences (COI) for Top {num_sequences} Taxa"):
                     # Use species_list and filter valid species, as done in build_phylogenetic_tree
                     valid_species = [s for s in species_list if s != 'Unknown' and is_species_level(s)]
                     if not valid_species:
                         valid_species = [s for s in species_list if s != 'Unknown']
-              
+             
                     sequences = []
                     failed_taxa = []
                     progress_bar = st.progress(0)
@@ -2904,7 +3682,6 @@ else:
                         st.write("No sequences found.")
             else:
                 st.write(f"No data found for '{search}'. Please try another location or species.")
-      
       
 # Footer and notes
 st.markdown("""
